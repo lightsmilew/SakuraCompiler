@@ -5,8 +5,9 @@
 // than on textual LLVM IR:
 //
 //   * every opcode is classified into an MLIR-style *dialect* (func / arith /
-//     cf / memref) and carries a fully-qualified operation name, so the dump
-//     produced by Module::toString() reads like MLIR assembly, e.g.
+//     cf / scf / memref / tensor) and carries a fully-qualified operation
+//     name, so the dump produced by Module::toString() reads like MLIR
+//     assembly, e.g.
 //
 //       module {
 //         func.func private @putint(i32)
@@ -71,8 +72,29 @@ enum class Op : uint8_t {
   // func dialect
   Ret,  Call,                     // func.return / func.call
 
-  // cf dialect (structured control flow)
+  // cf dialect (unstructured control flow, the bottom layer)
   Br,   CondBr,                   // cf.br / cf.cond_br
+
+  // scf dialect (middle layer): structured loops that are not countable.
+  // scf.while is a region op: it owns its condition blocks (condRegion,
+  // terminated by scf.condition) and its body blocks (bodyRegion, terminated
+  // by scf.yield).  Loops that cannot be represented in scf (body contains
+  // return / break / continue) stay in the flat cf form.
+  ScfWhile,                       // scf.while { condRegion } do { bodyRegion }
+  ScfCondition,                   // scf.condition %c  (terminates condRegion)
+  ScfYield,                       // scf.yield          (terminates bodyRegion)
+
+  // affine dialect (top layer): canonical counting loops.  affine.for is a
+  // region op whose bodyRegion (terminated by affine.yield) runs while the
+  // induction slot satisfies `iv <op> ub`; after every iteration the slot is
+  // stepped by `step`.  Operands: ops[0] = exit block, ops[1] = iv slot (ptr,
+  // a memref.alloca result), ops[2] = lower bound lb (i32), ops[3] = upper
+  // bound ub (i32); Instruction::cond holds the loop predicate (Lt/Le/Gt/Ge,
+  // int comparison against ub) and Instruction::step the signed stride.
+  // Lowering re-materialises the loop as `store lb, slot; while (slot<ub)
+  // { body; slot += step }`, so lb/ub may be any i32 SSA values.
+  AffineFor,                      // affine.for iv = lb to ub step N
+  AffineYield,                    // affine.yield (terminates the body region)
 
   // memref dialect (memory objects; addresses are `ptr` values)
   Alloca, Load, Store, Gep,       // memref.alloca / load / store / gep
@@ -115,9 +137,9 @@ enum class Cond : uint8_t {
 // exactly one dialect; opName() yields its fully-qualified spelling, e.g.
 // "func.call", "arith.addi", "cf.cond_br".
 // ---------------------------------------------------------------------------
-enum class Dialect : uint8_t { Func, Arith, Cf, Memref, Tensor };
+enum class Dialect : uint8_t { Func, Arith, Affine, Cf, Scf, Memref, Tensor };
 
-const char *dialectName(Dialect d);   // "func" | "arith" | "cf" | "memref"
+const char *dialectName(Dialect d);   // "func" | "arith" | "affine" | ...
 Dialect dialectOf(Op o);              // dialect an opcode belongs to
 const char *opMnemonic(Op o);         // e.g. "call", "addi", "cond_br"
 inline std::string opName(Op o) {
@@ -178,11 +200,26 @@ struct Instruction : Value {
   Type elem = Type::I32;        // Alloca element type / Load-Store element hint
                                // / tensor-op element scalar type
   int64_t n = 0;                // Alloca element count
+  int64_t step = 0;             // affine.for signed stride (may be negative)
   std::vector<int64_t> shape;   // tensor-op static shape (dims; {M,N,P} for matmul)
   int line = 0;                 // source line (debug)
 
+  // Region ops (scf.while / affine.for): blocks owned by the structured
+  // construct.  For scf.while, condRegion holds the condition sub-CFG and
+  // ends with Op::ScfCondition, bodyRegion holds the loop body and ends with
+  // Op::ScfYield.  For affine.for, only bodyRegion is used (terminated by
+  // Op::AffineYield); the bounds/predicate/step live in ops[] / cond / step.
+  // ops[0] is always the exit BasicBlock (where control continues after the
+  // loop).
+  std::vector<std::unique_ptr<BasicBlock>> condRegion;
+  std::vector<std::unique_ptr<BasicBlock>> bodyRegion;
+
   Instruction(Op o, Type t) : op(o) { ty = t; }
   bool hasResult() const { return ty != Type::Void; }
+
+  Instruction(Instruction &&) noexcept;
+  Instruction &operator=(Instruction &&) noexcept;
+  ~Instruction();
 };
 
 // ---- basic block ---------------------------------------------------------
@@ -232,10 +269,24 @@ public:
 
   const std::string &id() const { return name_; }
   std::vector<std::unique_ptr<GlobalVar>> &globals() { return globals_; }
+  const std::vector<std::unique_ptr<GlobalVar>> &globals() const {
+    return globals_;
+  }
   std::vector<std::unique_ptr<Function>> &functions() { return functions_; }
+  const std::vector<std::unique_ptr<Function>> &functions() const {
+    return functions_;
+  }
 
   // Prints the module in MLIR-style assembly (see the file comment above).
   std::string toString();
+
+  // NOTE: Module is a plain IR container (data + printer).  All lowering and
+  // optimisation live in midend/pass as Pass objects driven by a PassManager
+  // (see PassManager.h / Passes.h): IRBuilder output is the affine layer,
+  // expand-tensor-ops lowers tensor ops to affine.for, lower-affine-to-scf
+  // lowers affine.for to scf.while, and canonicalize-control-flow flattens
+  // every structured loop to the cf form the back-end consumes.  The last
+  // pass, verify-cf-only, guarantees no structured/whole-tensor op survives.
 
 private:
   std::string name_;

@@ -10,8 +10,14 @@ namespace ir {
 bool BasicBlock::hasTerminator() const {
   if (instrs.empty()) return false;
   Op o = instrs.back()->op;
-  return o == Op::Ret || o == Op::Br || o == Op::CondBr;
+  return o == Op::Ret || o == Op::Br || o == Op::CondBr ||
+         o == Op::ScfWhile || o == Op::ScfCondition || o == Op::ScfYield ||
+         o == Op::AffineFor || o == Op::AffineYield;
 }
+
+Instruction::Instruction(Instruction &&) noexcept = default;
+Instruction &Instruction::operator=(Instruction &&) noexcept = default;
+Instruction::~Instruction() = default;
 
 ConstantInt *Module::constInt(int32_t v) {
   auto *c = new ConstantInt(v);
@@ -85,7 +91,9 @@ const char *dialectName(Dialect d) {
   switch (d) {
   case Dialect::Func:   return "func";
   case Dialect::Arith:  return "arith";
+  case Dialect::Affine: return "affine";
   case Dialect::Cf:     return "cf";
+  case Dialect::Scf:    return "scf";
   case Dialect::Memref: return "memref";
   default:              return "tensor";
   }
@@ -99,6 +107,13 @@ Dialect dialectOf(Op o) {
   case Op::Br:
   case Op::CondBr:
     return Dialect::Cf;
+  case Op::ScfWhile:
+  case Op::ScfCondition:
+  case Op::ScfYield:
+    return Dialect::Scf;
+  case Op::AffineFor:
+  case Op::AffineYield:
+    return Dialect::Affine;
   case Op::Alloca:
   case Op::Load:
   case Op::Store:
@@ -120,6 +135,11 @@ const char *opMnemonic(Op o) {
   case Op::Call:   return "call";
   case Op::Br:     return "br";
   case Op::CondBr: return "cond_br";
+  case Op::ScfWhile:    return "while";
+  case Op::ScfCondition:return "condition";
+  case Op::ScfYield:    return "yield";
+  case Op::AffineFor:   return "for";
+  case Op::AffineYield: return "yield";
   case Op::Alloca: return "alloca";
   case Op::Load:   return "load";
   case Op::Store:  return "store";
@@ -246,26 +266,48 @@ std::string Module::toString() {
   for (const auto &f : functions_) {
     if (f->isLib) continue;
 
-    // SSA result names (%0, %1, ...) in block order
+    // Collect blocks and instructions in *print* order.  A region op expands
+    // its condRegion and then its bodyRegion at the position where it sits,
+    // so nested scf.while blocks print before the rest of the containing
+    // block; SSA names and block labels follow the same order.
+    std::vector<const BasicBlock *> order;
+    std::vector<Instruction *> ops;
+    std::function<void(const std::vector<std::unique_ptr<BasicBlock>> &)>
+        collectAll = [&](const std::vector<std::unique_ptr<BasicBlock>> &bs) {
+          for (const auto &b : bs) {
+            order.push_back(b.get());
+            for (const auto &inst : b->instrs) {
+              ops.push_back(inst.get());
+              if (inst->op == Op::ScfWhile) {
+                collectAll(inst->condRegion);
+                collectAll(inst->bodyRegion);
+              } else if (inst->op == Op::AffineFor) {
+                collectAll(inst->bodyRegion);
+              }
+            }
+          }
+        };
+    collectAll(f->blocks);
+
+    // SSA result names (%0, %1, ...) in print order
     std::unordered_map<const Instruction *, std::string> ssa;
     int seq = 0;
-    for (const auto &b : f->blocks)
-      for (const auto &inst : b->instrs)
-        if (inst->hasResult()) ssa[inst.get()] = "%" + std::to_string(seq++);
+    for (Instruction *inst : ops)
+      if (inst->hasResult()) ssa[inst] = "%" + std::to_string(seq++);
 
     // block labels ^bb0, ^bb1, ...  (the entry label is only printed when a
     // branch targets it, matching MLIR's canonical output)
     std::unordered_map<const BasicBlock *, std::string> blk;
-    for (size_t i = 0; i < f->blocks.size(); ++i)
-      blk[f->blocks[i].get()] = "^bb" + std::to_string(i);
+    for (size_t i = 0; i < order.size(); ++i)
+      blk[order[i]] = "^bb" + std::to_string(i);
     bool entryTargeted = false;
-    if (!f->blocks.empty()) {
-      const BasicBlock *entry = f->blocks.front().get();
-      for (const auto &b : f->blocks)
-        for (const auto &inst : b->instrs)
-          if (inst->op == Op::Br || inst->op == Op::CondBr)
-            for (Value *v : inst->ops)
-              if (v == entry) entryTargeted = true;
+    if (!order.empty()) {
+      const BasicBlock *entry = order.front();
+      for (Instruction *inst : ops)
+        if (inst->op == Op::Br || inst->op == Op::CondBr ||
+            inst->op == Op::ScfCondition)
+          for (Value *v : inst->ops)
+            if (v == entry) entryTargeted = true;
     }
 
     // hoisted constants (arith.constant in the entry block)
@@ -292,14 +334,13 @@ std::string Module::toString() {
       return false;
     };
     bool anyNot = false;
-    for (const auto &b : f->blocks)
-      for (const auto &inst : b->instrs) {
-        if (inst->op == Op::Not) anyNot = true;
-        for (Value *v : inst->ops) {
-          if (auto *ci = dynamic_cast<ConstantInt *>(v)) addCI(ci);
-          else if (auto *cf = dynamic_cast<ConstantFloat *>(v)) addCF(cf);
-        }
+    for (Instruction *inst : ops) {
+      if (inst->op == Op::Not) anyNot = true;
+      for (Value *v : inst->ops) {
+        if (auto *ci = dynamic_cast<ConstantInt *>(v)) addCI(ci);
+        else if (auto *cf = dynamic_cast<ConstantFloat *>(v)) addCF(cf);
       }
+    }
     if (anyNot && !hasIntOne()) consts.push_back({nullptr, nullptr, true});
 
     std::vector<std::string> constName(consts.size());
@@ -356,31 +397,60 @@ std::string Module::toString() {
     os << " {\n";
 
     // ---- body ------------------------------------------------------------
-    bool firstBlock = true;
-    for (size_t bi = 0; bi < f->blocks.size(); ++bi) {
-      const auto &b = f->blocks[bi];
-      bool isEntry = (bi == 0);
-      if (!(isEntry && !entryTargeted)) os << "  " << blk[b.get()] << ":\n";
-      if (firstBlock) {
-        // hoist constants into the entry block so they dominate every use
-        for (size_t i = 0; i < consts.size(); ++i) {
-          os << "    " << constName[i] << " = arith.constant ";
-          const CEntry &e = consts[i];
-          if (e.one) os << "1 : i32";
-          else if (e.ci) os << e.ci->v << " : i32";
-          else {
-            os << fmtFloat(e.cf->v) << " : f32 ; 0x" << std::hex
-               << e.cf->bits() << std::dec;
+    // Recursive region printer: block labels sit at `labelIndent`, their
+    // instructions at labelIndent+2.  An scf.while op prints its condRegion
+    // and bodyRegion inline, so nested loops appear inside their parent.
+    std::function<void(const std::vector<std::unique_ptr<BasicBlock>> &, int,
+                       bool)>
+        printBlocks;
+    printBlocks = [&](const std::vector<std::unique_ptr<BasicBlock>> &bs,
+                      int labelIndent, bool topList) {
+      for (size_t bi = 0; bi < bs.size(); ++bi) {
+        const auto &b = bs[bi];
+        bool isEntryBlock = topList && bi == 0;
+        if (!(isEntryBlock && !entryTargeted))
+          os << std::string(labelIndent, ' ') << blk[b.get()] << ":\n";
+        if (isEntryBlock) {
+          // hoist constants into the entry block so they dominate every use
+          for (size_t i = 0; i < consts.size(); ++i) {
+            os << std::string(labelIndent + 2, ' ') << constName[i]
+               << " = arith.constant ";
+            const CEntry &e = consts[i];
+            if (e.one) os << "1 : i32";
+            else if (e.ci) os << e.ci->v << " : i32";
+            else {
+              os << fmtFloat(e.cf->v) << " : f32 ; 0x" << std::hex
+                 << e.cf->bits() << std::dec;
+            }
+            os << "\n";
           }
-          os << "\n";
         }
-        firstBlock = false;
-      }
-      for (const auto &inst : b->instrs) {
-        std::string res;
-        if (inst->hasResult()) res = ssa.at(inst.get()) + " = ";
-        os << "    " << res;
-        switch (inst->op) {
+        int ii = labelIndent + 2;
+        for (const auto &inst : b->instrs) {
+          if (inst->op == Op::ScfWhile) {
+            os << std::string(ii, ' ') << "scf.while {\n";
+            printBlocks(inst->condRegion, ii + 2, false);
+            os << std::string(ii, ' ') << "} do {\n";
+            printBlocks(inst->bodyRegion, ii + 2, false);
+            os << std::string(ii, ' ') << "}\n";
+            continue;
+          }
+          if (inst->op == Op::AffineFor) {
+            // affine.for iv = <lb> to <ub> step <n> { <bodyRegion> }
+            // (the induction value is read from the slot operand inside the
+            // body as memref.load; lb/ub are i32 SSA values)
+            os << std::string(ii, ' ') << "affine.for "
+               << nameOf(inst->ops[1]) << " = " << nameOf(inst->ops[2])
+               << " to " << nameOf(inst->ops[3]) << " step " << inst->step
+               << " {\n";
+            printBlocks(inst->bodyRegion, ii + 2, false);
+            os << std::string(ii, ' ') << "}\n";
+            continue;
+          }
+          std::string res;
+          if (inst->hasResult()) res = ssa.at(inst.get()) + " = ";
+          os << std::string(ii, ' ') << res;
+          switch (inst->op) {
         case Op::Ret: {
           os << "func.return";
           if (!inst->ops.empty()) os << " " << nameOf(inst->ops[0]);
@@ -393,6 +463,30 @@ std::string Module::toString() {
         case Op::CondBr: {
           os << "cf.cond_br " << nameOf(inst->ops[0]) << ", "
              << nameOf(inst->ops[1]) << ", " << nameOf(inst->ops[2]);
+          break;
+        }
+        case Op::ScfCondition: {
+          os << "scf.condition " << nameOf(inst->ops[0]);
+          break;
+        }
+        case Op::ScfYield: {
+          os << "scf.yield";
+          break;
+        }
+        case Op::ScfWhile: {
+          // unreachable: region ops are printed before the switch; kept so
+          // the compiler knows the enum is fully handled
+          os << "scf.while";
+          break;
+        }
+        case Op::AffineYield: {
+          os << "affine.yield";
+          break;
+        }
+        case Op::AffineFor: {
+          // unreachable: region ops are printed before the switch; kept so
+          // the compiler knows the enum is fully handled
+          os << "affine.for";
           break;
         }
         case Op::Alloca: {
@@ -505,9 +599,11 @@ std::string Module::toString() {
           break;
         }
         }
-        os << "\n";
+          os << "\n";
+        }
       }
-    }
+    };
+    printBlocks(f->blocks, 2, true);
     os << "  }\n";
   }
 

@@ -2,7 +2,8 @@
 # Runs on the RISC-V Ubuntu VM (QEMU).  For every .s file in the given suite
 # directories (under $WORK), assembles it, links it against libsysy_riscv.a,
 # runs it (feeding <name>.in when present) and compares stdout + exit code
-# against <name>.out (whitespace-normalised, timer lines filtered).
+# against <name>.out (whitespace-normalised, timer lines filtered).  Each pass
+# also prints "PASS <name>" so the host can update its verification cache.
 #
 # Usage: guest_test.sh <dir1> [dir2 ...]
 # Directories are absolute paths on the guest.
@@ -72,6 +73,8 @@ for dir in "$@"; do
     normalize "/tmp/${base}.out.filtered" > "/tmp/${base}.act.norm"
     if diff -q "/tmp/${base}.exp.norm" "/tmp/${base}.act.norm" > /dev/null; then
       PASS=$((PASS + 1))
+      # per-case verdict so the host can update its verification cache
+      echo "PASS $base"
     else
       echo "FAIL $base"
       FAIL=$((FAIL + 1))
@@ -82,6 +85,10 @@ for dir in "$@"; do
   done
 done
 
-echo "===== PASS=$PASS FAIL=$FAIL ====="
+# when driven by qemu_verify.sh the host prints the canonical grand total
+# (it also counts CACHED cases); standalone runs get the local summary here
+if [ "${GUEST_VERIFY_MODE:-0}" -ne 1 ]; then
+  echo "===== PASS=$PASS FAIL=$FAIL ====="
+fi
 if [ "$FAIL" -gt 0 ]; then echo "see $LOG"; fi
 exit "$FAIL"

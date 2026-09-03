@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include "../common/Common.h"
+#include "../midend/pass/Passes.h" // isCfOnly: the back-end only accepts cf
 
 using namespace sakura::ir;
 using namespace sakura::backend;
@@ -60,7 +61,6 @@ public:
   int nextReg = 0;
   int nextFrameByte = 0;
   int maxStk = 0;
-  int tensorSeq = 0;  // unique ids for tensor-loop machine labels
   MBlock *cur = nullptr;
 
   std::string labelFor(BasicBlock *bb) const {
@@ -315,376 +315,10 @@ void cmpOperands(FnLower &L, Instruction *i, int32_t &a, int32_t &b,
 }
 
 // ---------------------------------------------------------------------------
-// Tensor lowering
-//
-// tensor.<op> IR ops are expanded into explicit machine loop nests operating
-// on the element buffers.  This keeps the tensor semantics first-class in the
-// IR (so the mid-end can later optimise whole tensors / vectorise) and defers
-// the scalar expansion to the back end.
+// Whole-tensor ops (TCopy/TAdd*/.../TMatmul*) are expanded into affine.for
+// loop nests in the mid-end (midend/pass/TensorLower.cpp), so no tensor op
+// should survive to instruction selection.  Reaching here is a pipeline bug.
 // ---------------------------------------------------------------------------
-
-// Register-kind helpers for tensor codegen.
-struct TVal {
-  int32_t base = -1;  // buffer base address (X register)
-  bool isBuf = false;
-  int32_t scalar = -1; // hoisted scalar value (X or F register)
-};
-
-// A fresh machine block appended to the current function.
-MBlock *appendBlock(FnLower &L, const std::string &name) {
-  MBlock mb;
-  mb.name = name;
-  L.mf.blocks.push_back(mb);
-  return &L.mf.blocks.back();
-}
-
-// Unique label used to name the loop blocks of one tensor expansion.
-std::string tlabel(FnLower &L, const char *role) {
-  return ".L" + L.mf.name + "_t" + std::to_string(L.tensorSeq) + "_" + role;
-}
-
-// Small builders that emit into L.cur.
-int32_t tLi(FnLower &L, int64_t v, int line) {
-  MInst m;
-  m.op = MOp::Li;
-  m.dst = L.newReg();
-  m.imm = (int32_t)v;
-  m.line = line;
-  L.emit(m);
-  return m.dst;
-}
-
-int32_t tLoadIdx(FnLower &L, int64_t off, bool isF, int line) {
-  MInst m;
-  m.op = isF ? MOp::FlwF : MOp::LwF;
-  m.dst = L.newReg();
-  m.imm = (int32_t)off;
-  m.ty = isF ? Type::F32 : Type::I32;
-  m.line = line;
-  L.emit(m);
-  return m.dst;
-}
-
-void tStoreIdx(FnLower &L, int32_t v, int64_t off, bool isF, int line) {
-  MInst m;
-  m.op = isF ? MOp::FswF : MOp::SwF;
-  m.a = v;
-  m.imm = (int32_t)off;
-  m.ty = isF ? Type::F32 : Type::I32;
-  m.line = line;
-  L.emit(m);
-}
-
-int32_t tLoadAt(FnLower &L, int32_t addr, bool isF, int line) {
-  MInst m;
-  m.op = isF ? MOp::Flw : MOp::Lw;
-  m.dst = L.newReg();
-  m.a = addr;
-  m.ty = isF ? Type::F32 : Type::I32;
-  m.line = line;
-  L.emit(m);
-  return m.dst;
-}
-
-void tStoreAt(FnLower &L, int32_t v, int32_t addr, bool isF, int line) {
-  MInst m;
-  m.op = isF ? MOp::Fsw : MOp::Sw;
-  m.a = v;
-  m.b = addr;
-  m.ty = isF ? Type::F32 : Type::I32;
-  m.line = line;
-  L.emit(m);
-}
-
-void tJmp(FnLower &L, const std::string &target, int line) {
-  MInst m;
-  m.op = MOp::Jmp;
-  m.sym = target;
-  m.line = line;
-  L.emit(m);
-}
-
-void tBrz(FnLower &L, int32_t cond, const std::string &target, int line) {
-  MInst m;
-  m.op = MOp::BrZ;
-  m.a = cond;
-  m.sym = target;
-  m.line = line;
-  L.emit(m);
-}
-
-int32_t tAdd(FnLower &L, int32_t a, int32_t b, Type ty, int line) {
-  return L.op2(MOp::IAdd, a, b, line, ty);
-}
-
-int32_t tIslt(FnLower &L, int32_t a, int64_t b, int line) {
-  if (fits12(b)) return L.opI(MOp::ISlti, a, (int32_t)b, line);
-  int32_t br = tLi(L, b, line);
-  return L.op2(MOp::ISlt, a, br, line);
-}
-
-// Lower a whole-tensor memory op (TCopy/TAdd*/TSub*/TMul*/TDiv*/TRem*/TNeg*)
-// into an elementwise loop.
-void lowerTensorElementwise(FnLower &L, Instruction *i) {
-  int line = i->line;
-  bool isF = i->elem == Type::F32;
-
-  int64_t total = 1;
-  for (int64_t d : i->shape) total *= d;
-  if (total <= 0 || total > INT32_MAX)
-    throw CompileError("internal: bad tensor size", line);
-  int32_t n = (int32_t)total;
-  int32_t four = tLi(L, 4, line);
-
-  int64_t idxOff = L.nextFrameByte;
-  L.nextFrameByte += 4;
-
-  // hoist operand addresses / scalar values once, before the loop
-  TVal dest;
-  {
-    PtrVal &p = L.ptrOf(i->ops[0]);
-    dest.base = L.materializePtr(p, line);
-    dest.isBuf = true;
-  }
-  std::vector<TVal> ops;
-  for (size_t k = 1; k < i->ops.size(); ++k) {
-    Value *v = i->ops[k];
-    TVal o;
-    if (v->ty == Type::Ptr) {
-      o.isBuf = true;
-      PtrVal &p = L.ptrOf(v);
-      o.base = L.materializePtr(p, line);
-    } else {
-      o.scalar = L.forceReg(v, line);
-    }
-    ops.push_back(o);
-  }
-
-  L.tensorSeq++;
-  std::string Lchk = tlabel(L, "chk");
-  std::string Lbody = tlabel(L, "body");
-  std::string Ldone = tlabel(L, "done");
-  std::string Lcont = tlabel(L, "cont");
-
-  // init index slot (idx = 0) then branch to the header
-  int32_t z = tLi(L, 0, line);
-  tStoreIdx(L, z, idxOff, false, line);
-  tJmp(L, Lchk, line);
-
-  // header: idx < n
-  L.cur = appendBlock(L, Lchk);
-  int32_t iv = tLoadIdx(L, idxOff, false, line);
-  int32_t in = tIslt(L, iv, n, line);
-  tBrz(L, in, Ldone, line);
-
-  // body: elementwise op at byte offset iv*4
-  L.cur = appendBlock(L, Lbody);
-  int32_t i2 = tLoadIdx(L, idxOff, false, line);
-  int32_t byteOff = L.op2(MOp::IMul, i2, four, line);
-  int32_t daddr = tAdd(L, dest.base, byteOff, Type::Ptr, line);
-
-  std::vector<int32_t> vals;
-  for (auto &o : ops) {
-    if (o.isBuf) {
-      int32_t a = tAdd(L, o.base, byteOff, Type::Ptr, line);
-      vals.push_back(tLoadAt(L, a, isF, line));
-    } else {
-      vals.push_back(o.scalar);
-    }
-  }
-
-  int32_t res;
-  switch (i->op) {
-  case Op::TCopy: res = vals[0]; break;
-  case Op::TNegI: res = L.op1(MOp::INeg, vals[0], line); break;
-  case Op::TNegF: res = L.op1(MOp::FNeg, vals[0], line); break;
-  case Op::TAddI: res = L.op2(MOp::IAdd, vals[0], vals[1], line); break;
-  case Op::TSubI: res = L.op2(MOp::ISub, vals[0], vals[1], line); break;
-  case Op::TMulI: res = L.op2(MOp::IMul, vals[0], vals[1], line); break;
-  case Op::TDivI: res = L.op2(MOp::IDiv, vals[0], vals[1], line); break;
-  case Op::TRemI: res = L.op2(MOp::IRem, vals[0], vals[1], line); break;
-  case Op::TAddF: res = L.op2(MOp::FAdd, vals[0], vals[1], line); break;
-  case Op::TSubF: res = L.op2(MOp::FSub, vals[0], vals[1], line); break;
-  case Op::TMulF: res = L.op2(MOp::FMul, vals[0], vals[1], line); break;
-  case Op::TDivF: res = L.op2(MOp::FDiv, vals[0], vals[1], line); break;
-  default:
-    throw CompileError("internal: not an elementwise tensor op", line);
-  }
-  tStoreAt(L, res, daddr, isF, line);
-  int32_t ni = L.opI(MOp::IAddI, i2, 1, line);
-  tStoreIdx(L, ni, idxOff, false, line);
-  tJmp(L, Lchk, line);
-
-  // exit: continue with the rest of the current IR block
-  L.cur = appendBlock(L, Ldone);
-  tJmp(L, Lcont, line);
-  L.cur = appendBlock(L, Lcont);
-}
-
-// Lower TMatmulI/TMatmulF (shape = {M, N, P}, i.e. MxN @ NxP -> MxP) into a
-// triple-nested loop.  Operands 1 and 2 never alias dest at this point: the IR
-// builder copies aliasing sources away before emitting the matmul.
-void lowerTensorMatmul(FnLower &L, Instruction *i) {
-  int line = i->line;
-  if (i->shape.size() != 3)
-    throw CompileError("internal: matmul shape must be {M,N,P}", line);
-  int64_t M = i->shape[0], N = i->shape[1], P = i->shape[2];
-  if (M <= 0 || N <= 0 || P <= 0)
-    throw CompileError("internal: bad matmul shape", line);
-  bool isF = i->elem == Type::F32;
-
-  int64_t siOff = L.nextFrameByte, sjOff = siOff + 4, skOff = siOff + 8,
-          saOff = siOff + 12;
-  L.nextFrameByte += 16;
-
-  int32_t aBase, bBase, cBase;
-  {
-    PtrVal &p = L.ptrOf(i->ops[1]);
-    aBase = L.materializePtr(p, line);
-    PtrVal &q = L.ptrOf(i->ops[2]);
-    bBase = L.materializePtr(q, line);
-    PtrVal &r = L.ptrOf(i->ops[0]);
-    cBase = L.materializePtr(r, line);
-  }
-
-  L.tensorSeq++;
-  std::string Lout = tlabel(L, "m_outer");      // i < M test
-  std::string Lob = tlabel(L, "m_outbody");     // j = 0
-  std::string Lmid = tlabel(L, "m_mid");        // j < P test
-  std::string Lmb = tlabel(L, "m_midbody");     // acc = k = 0
-  std::string Lin = tlabel(L, "m_inner");       // k < N test
-  std::string Lib = tlabel(L, "m_innerbody");   // acc += ...
-  std::string Lst = tlabel(L, "m_store");       // C[i][j] = acc; j++
-  std::string Loi = tlabel(L, "m_outerinc");    // i++
-  std::string Ldone = tlabel(L, "m_done");
-  std::string Lcont = tlabel(L, "cont");
-
-  int32_t zeroI = tLi(L, 0, line);
-  tStoreIdx(L, zeroI, siOff, false, line);
-  tJmp(L, Lout, line);
-
-  // Every machine block below ends with its control transfer so that the
-  // machine CFG (and hence liveness / register allocation) sees the correct
-  // edges: a header block tests the loop counter and branches to the exit,
-  // falling through to its body; a body block ends by jumping back to the
-  // header.
-
-  // outer header: for (i = 0; i < M; i++)
-  L.cur = appendBlock(L, Lout);
-  {
-    int32_t iv = tLoadIdx(L, siOff, false, line);
-    tBrz(L, tIslt(L, iv, M, line), Ldone, line);
-  }
-  // outer body: j = 0
-  L.cur = appendBlock(L, Lob);
-  {
-    int32_t jz = tLi(L, 0, line);
-    tStoreIdx(L, jz, sjOff, false, line);
-    tJmp(L, Lmid, line);
-  }
-
-  // middle header: for (j = 0; j < P; j++)
-  L.cur = appendBlock(L, Lmid);
-  {
-    int32_t jv = tLoadIdx(L, sjOff, false, line);
-    tBrz(L, tIslt(L, jv, P, line), Loi, line);
-  }
-  // middle body: acc = 0; k = 0
-  L.cur = appendBlock(L, Lmb);
-  {
-    if (isF) {
-      MInst m;
-      m.op = MOp::LiF; // float zero (bit pattern 0)
-      m.dst = L.newReg();
-      m.imm = 0;
-      m.line = line;
-      L.emit(m);
-      tStoreIdx(L, m.dst, saOff, true, line);
-    } else {
-      tStoreIdx(L, zeroI, saOff, false, line);
-    }
-    tStoreIdx(L, zeroI, skOff, false, line);
-    tJmp(L, Lin, line);
-  }
-
-  // inner header: for (k = 0; k < N; k++)
-  L.cur = appendBlock(L, Lin);
-  {
-    int32_t kv = tLoadIdx(L, skOff, false, line);
-    tBrz(L, tIslt(L, kv, N, line), Lst, line);
-  }
-  // inner body: acc += A[i][k] * B[k][j]
-  // (addresses are re-derived from the i/j/k slots each iteration)
-  L.cur = appendBlock(L, Lib);
-  {
-    int32_t kv = tLoadIdx(L, skOff, false, line);
-    int32_t iv = tLoadIdx(L, siOff, false, line);
-    int32_t jv = tLoadIdx(L, sjOff, false, line);
-    int32_t fourR = tLi(L, 4, line);
-    int32_t nR = tLi(L, N, line);
-    int32_t pR = tLi(L, P, line);
-    // aAddr = aBase + (i*N + k)*4
-    int32_t t1 = L.op2(MOp::IMul, iv, nR, line);
-    int32_t t2 = L.op2(MOp::IAdd, t1, kv, line);
-    int32_t t3 = L.op2(MOp::IMul, t2, fourR, line);
-    int32_t aAddr = tAdd(L, aBase, t3, Type::Ptr, line);
-    // bAddr = bBase + (k*P + j)*4
-    int32_t t4 = L.op2(MOp::IMul, kv, pR, line);
-    int32_t t5 = L.op2(MOp::IAdd, t4, jv, line);
-    int32_t t6 = L.op2(MOp::IMul, t5, fourR, line);
-    int32_t bAddr = tAdd(L, bBase, t6, Type::Ptr, line);
-    int32_t av = tLoadAt(L, aAddr, isF, line);
-    int32_t bv = tLoadAt(L, bAddr, isF, line);
-    int32_t acc = tLoadIdx(L, saOff, isF, line);
-    int32_t prod = isF ? L.op2(MOp::FMul, av, bv, line)
-                       : L.op2(MOp::IMul, av, bv, line);
-    int32_t sum = isF ? L.op2(MOp::FAdd, acc, prod, line)
-                      : L.op2(MOp::IAdd, acc, prod, line);
-    tStoreIdx(L, sum, saOff, isF, line);
-    int32_t nk = L.opI(MOp::IAddI, kv, 1, line);
-    tStoreIdx(L, nk, skOff, false, line);
-    tJmp(L, Lin, line);
-  }
-
-  // store: C[i][j] = acc; j++
-  L.cur = appendBlock(L, Lst);
-  {
-    int32_t iv = tLoadIdx(L, siOff, false, line);
-    int32_t jv = tLoadIdx(L, sjOff, false, line);
-    int32_t acc = tLoadIdx(L, saOff, isF, line);
-    int32_t p4 = tLi(L, P * 4, line);
-    int32_t j4 = tLi(L, 4, line);
-    int32_t t1 = L.op2(MOp::IMul, iv, p4, line);
-    int32_t t2 = L.op2(MOp::IMul, jv, j4, line);
-    int32_t t3 = L.op2(MOp::IAdd, t1, t2, line);
-    int32_t cAddr = tAdd(L, cBase, t3, Type::Ptr, line);
-    tStoreAt(L, acc, cAddr, isF, line);
-    int32_t nj = L.opI(MOp::IAddI, jv, 1, line);
-    tStoreIdx(L, nj, sjOff, false, line);
-    tJmp(L, Lmid, line);
-  }
-
-  // outer inc: i++
-  L.cur = appendBlock(L, Loi);
-  {
-    int32_t iv = tLoadIdx(L, siOff, false, line);
-    int32_t ni = L.opI(MOp::IAddI, iv, 1, line);
-    tStoreIdx(L, ni, siOff, false, line);
-    tJmp(L, Lout, line);
-  }
-
-  L.cur = appendBlock(L, Ldone);
-  tJmp(L, Lcont, line);
-  L.cur = appendBlock(L, Lcont);
-}
-
-void lowerTensorOp(FnLower &L, Instruction *i) {
-  if (i->op == Op::TMatmulI || i->op == Op::TMatmulF) {
-    lowerTensorMatmul(L, i);
-    return;
-  }
-  lowerTensorElementwise(L, i);
-}
 
 void lowerInstruction(FnLower &L, Instruction *i) {
   int line = i->line;
@@ -916,8 +550,8 @@ void lowerInstruction(FnLower &L, Instruction *i) {
   case Op::TDivF:
   case Op::TMatmulI:
   case Op::TMatmulF:
-    lowerTensorOp(L, i);
-    return;
+    throw CompileError("internal: tensor op reached ISel; it must be expanded "
+                       "in the mid-end (TensorLower)", line);
   default:
     throw CompileError("internal: unhandled opcode in ISel", line);
   }
@@ -1058,6 +692,14 @@ void fuseBranchCompares(FnLower &L) {
 } // namespace
 
 std::vector<MachineFunc> runInstructionSelection(Module *mod) {
+  // The mid-end contract: the back-end only ever consumes flat cf IR.  This
+  // is enforced by the verify-cf-only pass in runMidEndPipeline(); the check
+  // here makes the boundary hold even if a future driver bypasses the
+  // pipeline.
+  if (!isCfOnly(*mod))
+    throw CompileError(
+        "internal: instruction selection only accepts cf-only IR (a "
+        "structured/whole-tensor op survived the mid-end pipeline)");
   std::vector<MachineFunc> out;
   for (auto &fu : mod->functions()) {
     Function *fn = fu.get();

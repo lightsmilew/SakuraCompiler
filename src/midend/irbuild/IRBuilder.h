@@ -8,7 +8,12 @@
 // into byte offsets and emitting multiply-add chains for dynamic ones).
 //
 // A small scope stack (`env_` + `scopeStack_`) mirrors the block structure of
-// the source so shadowing works; `loops_` tracks break/continue targets.
+// the source so shadowing works; `loops_` tracks break/continue targets for
+// while loops that stay in the flat cf form.  Clean while loops (no return /
+// break / continue in their body) are instead emitted as structured scf.while
+// region ops (see visitWhile): newBlock() appends to whatever block list
+// `regStack_` points at, so nested loops and ifs land in the owning
+// scf.while's body/cond regions.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -92,6 +97,10 @@ private:
   Value *emitCmp(Cond c, Value *l, Value *r, bool isFloat, int line);
   Value *convert(Value *v, Type dst, int line);   // sitofp / fptosi / id
 
+  // Where newBlock() appends its block: the function-body list, or - while
+  // lowering a structured loop - one of the scf.while op's region vectors.
+  std::vector<std::vector<std::unique_ptr<BasicBlock>> *> regStack_;
+
   ConstantInt *cI(int32_t v) { return mod_->constInt(v); }
   ConstantFloat *cF(float v) { return mod_->constFloat(v); }
   Value *constOf(const ConstVal &cv);
@@ -111,6 +120,31 @@ private:
   void visitReturn(ReturnStmtNode *s);
   void visitAssign(AssignStmtNode *s);
   void visitExprStmt(ExprStmtNode *s);
+
+  // Decide whether a `while` can be represented as a structured scf.while:
+  // its body must contain no `return` and no break/continue that target it
+  // (break/continue inside a nested while belong to that while).
+  void scanLoopTree(StmtNode *n, bool &hasRet, bool &hasOwnBC);
+  bool whileIsClean(WhileStmtNode *s);
+
+  // ---- canonical counting loops (affine layer, the top of the mid-end) ----
+  // A clean `while (iv < ub) { body; iv = iv + step }` over a local int slot
+  // is kept as an affine.for region op (see Op::AffineFor).  Everything that
+  // cannot be proven to be a canonical counting loop stays in scf.while / cf.
+  struct CountLoop {
+    std::string iv;         // induction variable name
+    Obj *obj = nullptr;     // its local memory slot (an I32 memref.alloca)
+    ExprNode *bound = nullptr; // iteration-invariant upper bound expression
+    int64_t step = 0;       // positive constant stride
+  };
+  bool matchCountingWhile(WhileStmtNode *s, CountLoop &out);
+  bool boundIsInvariant(const ExprNode *bound, StmtNode *body,
+                        const std::string &ivName);
+  bool stmtTreeWritesName(StmtNode *s, const std::string &name,
+                          const StmtNode *skip = nullptr);
+  bool stmtTreeHasCall(StmtNode *s);
+  bool tryEmitAffineFor(WhileStmtNode *s);
+  void emitBodyWithoutTail(StmtNode *body); // loop body minus the tail increment
 
   // variable declarations inside a function
   void emitLocalVar(VarDefNode *def, TypeCat base, bool isConst);

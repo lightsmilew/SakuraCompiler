@@ -4,6 +4,9 @@
 # local compiler, then assembles / links / runs them on the RISC-V Ubuntu VM
 # (QEMU) and diffs stdout+exit code against the reference .out files.
 #
+# Cases whose freshly-compiled assembly is byte-identical to the last verified
+# run are skipped on the guest (see tools/qemu_verify.sh, build/.verify_cache).
+#
 # Requires the VM to be up with ssh on localhost:2222 (see tools/qemu_verify.sh).
 #
 #   ./scripts/test.sh [suite ...]     default: functional h_functional performance2026

@@ -2,9 +2,10 @@
 
 A self-contained SysY -> RISC-V64gc compiler. The frontend parses the SysY
 grammar (ANTLR4, visitor pattern) with a full semantic analyser, the mid-end
-builds an MLIR-style SSA IR (dialect-organised `func` / `arith` / `cf` /
-`memref` ops), and the back-end selects RISC-V instructions, performs
-graph-colouring register allocation and emits GNU `as`-compatible assembly.
+builds an MLIR-style SSA IR (dialect-organised `func` / `arith` / `cf` / `scf`
+/ `memref` / `tensor` ops; structured loops stay as `scf.while` region ops),
+and the back-end selects RISC-V instructions, performs graph-colouring
+register allocation and emits GNU `as`-compatible assembly.
 No third-party dependencies beyond the vendored ANTLR4 runtime.
 
 Verified end-to-end on a QEMU RISC-V Ubuntu guest (compiled assembly linked
@@ -23,7 +24,8 @@ src/
   SysY.g4                       ANTLR4 grammar
   frontend/                     ANTLR4 visitor AST builder + semantic analyser
   midend/ir/                    MLIR-style IR (module / function / block / op)
-  midend/irbuild/               SysY AST -> IR lowering
+  midend/irbuild/               SysY AST -> IR lowering (affine layer)
+  midend/pass/                  PassManager + pass pipeline (Pipeline/Passes)
   backend/                      ISel, graph-colouring RA, assembly emission
 3rd_party/antlr4-runtime/       vendored ANTLR4 C++ runtime
 scripts/
@@ -67,6 +69,11 @@ then:
 ./scripts/run.sh -qemu-test h_functional performance2026
 ```
 
+Repeat runs are cached: a case is re-run under QEMU only when its freshly
+produced assembly differs from the last verified one (or its sources / `.in` /
+`.out` / the compiler binary changed).  Verified assembly lives in
+`build/.verify_cache`, so unchanged runs skip the QEMU guest workload entirely.
+
 ## Design notes
 
 - **Frontend**: ANTLR4 lexer/parser generated from `src/SysY.g4`; a visitor
@@ -75,14 +82,28 @@ then:
   builtins (`getint`, `putch`, `getfloat`, `starttime`, ...) are declared and
   mapped to the runtime's exported names (`_sysy_starttime` etc.).
 - **Mid-end**: an MLIR-style SSA IR. Every opcode belongs to a dialect
-  (`func`, `arith`, `cf`, `memref`, `tensor`) and `--dump-ir` prints
-  dialect-qualified ops (`func.call`, `arith.addi`, `cf.cond_br`,
+  (`func`, `arith`, `cf`, `scf`, `affine`, `memref`, `tensor`) and `--dump-ir`
+  prints dialect-qualified ops (`func.call`, `arith.addi`, `cf.cond_br`,
   `memref.load`, `tensor.addi`, ...) in a standard MLIR-like textual form,
   with SSA values typed `i32` / `f32` / `ptr`. SysY scalars and arrays stay
   memory-resident: `memref.alloca` allocates a stack object, `memref.gep`
   folds byte offsets, and loads/stores access memory through addresses. The
   flat opcode enum is preserved as the single dispatch key used by back-end
   instruction selection.
+- **Structured loops**: `while` loops whose body cannot `return` / `break` /
+  `continue` out of the loop are preserved in the IR as MLIR-style
+  `scf.while` region ops (`scf.while { ^cond ... scf.condition %c } do {
+  ^body ... scf.yield }`), so loop structure stays first-class for later
+  mid-end passes. Loops with `break`/`continue`/`return` keep the plain
+  `cf.br`/`cf.cond_br` CFG form.
+- **Pass pipeline**: the mid-end is organised in three control-flow layers —
+  `affine` (counting loops stay `affine.for`), `scf` (generic `scf.while`)
+  and `cf` (flat CFG). `runMidEndPipeline()` (`midend/pass/Pipeline.cpp`)
+  owns a `PassManager` that runs `expand-tensor-ops`, `lower-affine-to-scf`,
+  `canonicalize-control-flow` and a trailing `verify-cf-only` back-end gate;
+  per-layer optimisation passes plug into the same sequence. The driver only
+  calls `runMidEndPipeline()` — the module handed to instruction selection /
+  register allocation / assembly is guaranteed pure cf.
 - **TensorType**: multi-dimensional `tensor int/float` values are first-class
   in the IR. A tensor is a buffer (alloca/global/pointer) plus a static
   shape carried on the op; whole-tensor ops (`tensor.addi`, `tensor.muli`,

@@ -1,8 +1,19 @@
 // SakuraCompiler driver.
-// Usage: compiler <input.sy> [-S] [-o out.s] [--dump-ir]
+// Usage: compiler <input.sy> [-S] [-o out.s] [--dump-ir] [--dump-affine]
+//        [--dump-scf] [--dump-cf]
 // Runs the full pipeline: lex/parse (ANTLR4) -> AST + semantic analysis ->
 // MLIR-style mid-end IR -> RISC-V instruction selection -> graph-colouring
 // register allocation -> assembly emission.
+//
+// main only wires the three high-level stages together:
+//   * front-end : ASTBuilder + SemanticAnalysis  (input.sy -> typed AST)
+//   * mid-end   : IRBuilder -> runMidEndPipeline (AST -> pure-cf IR)
+//   * back-end  : ISel -> RA -> Asm              (pure-cf IR -> .s)
+// runMidEndPipeline() (midend/pass/Pipeline.h) owns the PassManager and every
+// IR conversion/optimisation pass; the driver never assembles passes itself.
+// Its LayerView hook prints the module at each layer boundary, which backs
+// the --dump-affine / --dump-scf / --dump-cf flags (--dump-ir prints all
+// three and skips assembly emission).
 
 #include <fstream>
 #include <iostream>
@@ -18,6 +29,7 @@
 #include "backend/RA.h"
 #include "frontend/SemanticAnalysis.h"
 #include "midend/irbuild/IRBuilder.h"
+#include "midend/pass/Pipeline.h"
 
 using namespace antlr4;
 using namespace sakura;
@@ -48,10 +60,14 @@ std::string readAll(const std::string &path) {
 int main(int argc, char **argv) {
   std::string inputFile;
   std::string outFile;
-  bool dumpIr = false;
+  bool dumpIr = false;       // dump all three layer views, suppress assembly
+  bool dumpAffine = false, dumpScf = false, dumpCf = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--dump-ir") dumpIr = true;
+    else if (a == "--dump-affine") dumpAffine = true;
+    else if (a == "--dump-scf") dumpScf = true;
+    else if (a == "--dump-cf") dumpCf = true;
     else if (a == "-o") {
       if (i + 1 < argc) outFile = argv[++i];
     }
@@ -86,14 +102,30 @@ int main(int argc, char **argv) {
     SemanticAnalyzer analyzer(unit.get());
     analyzer.analyze();
 
-    // Mid-end: lower the checked AST into the MLIR-style IR module.
+    // ---- mid-end: AST -> pure-cf IR ------------------------------------------
+    // Lower the checked AST into the MLIR-style IR module and run the whole
+    // mid-end pipeline in one call: IRBuilder produces the affine layer, the
+    // pipeline (internally a PassManager) lowers it through the scf layer to
+    // flat cf and verifies the result.  `view` prints the module whenever the
+    // pipeline enters a layer, giving --dump-affine / --dump-scf / --dump-cf.
     auto base = inputFile.substr(inputFile.find_last_of("/\\") + 1);
     sakura::ir::IRBuilder irb(unit.get(), &analyzer.functions(), base);
     auto module = irb.run();
-    if (dumpIr) std::cout << module->toString();
+    sakura::ir::runMidEndPipeline(
+        *module, [&](const char *layer, sakura::ir::Module &m) {
+          std::string L = layer;
+          bool show = dumpIr;
+          show = show || (dumpAffine && L == "affine") ||
+                 (dumpScf && L == "scf") || (dumpCf && L == "cf");
+          if (show)
+            std::cout << "// ===== " << layer << " layer =====\n"
+                      << m.toString();
+        });
 
-    // Back-end: instruction selection + graph-colouring register allocation
-    // + assembly emission.
+    // ---- back-end: pure-cf IR -> RISC-V assembly -----------------------------
+    // The module is guaranteed to contain only cf / func / arith / memref ops
+    // (verified inside the mid-end pipeline).  Instruction selection + graph-
+    // colouring register allocation + assembly emission.
     auto fns = sakura::backend::runInstructionSelection(module.get());
     sakura::backend::runRegisterAlloc(fns);
     std::string asmText = sakura::backend::emitAssembly(module.get(), fns);

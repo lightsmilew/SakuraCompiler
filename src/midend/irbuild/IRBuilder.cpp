@@ -41,7 +41,7 @@ IRBuilder::Obj *IRBuilder::lookup(const string &name) {
 BasicBlock *IRBuilder::newBlock() {
   auto b = make_unique<BasicBlock>("label" + to_string(blockSeq_++));
   BasicBlock *p = b.get();
-  curFn_->blocks.push_back(move(b));
+  regStack_.back()->push_back(move(b));
   return p;
 }
 
@@ -211,6 +211,8 @@ void IRBuilder::buildFunction(FuncDefNode *fnNode) {
   retBuf_ = nullptr;
   tempSeq_ = 0;
   blockSeq_ = 0;
+  regStack_.clear();
+  regStack_.push_back(&fn->blocks); // new blocks land at function level
 
   pushScope(); // parameter scope
   BasicBlock *entry = newBlock();
@@ -341,21 +343,349 @@ void IRBuilder::visitIf(IfStmtNode *s) {
 
 void IRBuilder::visitWhile(WhileStmtNode *s) {
   if (curBB_->hasTerminator()) curBB_ = newBlock();
-  BasicBlock *condB = newBlock();
-  BasicBlock *bodyB = newBlock();
-  BasicBlock *endB = newBlock();
-  emitTerm(Op::Br, {condB}, s->line);
 
-  curBB_ = condB;
-  loops_.push_back({condB, endB});
-  emitCondBr(s->cond.get(), bodyB, endB);
+  // ---- unstructured form --------------------------------------------------
+  // A body that can `return`, `break` or `continue` out of this loop cannot
+  // be captured by scf.while's regions; keep the plain cf.br/cf.cond_br form
+  // (the same CFG the back-end used all along).
+  if (!whileIsClean(s)) {
+    BasicBlock *condB = newBlock();
+    BasicBlock *bodyB = newBlock();
+    BasicBlock *endB = newBlock();
+    emitTerm(Op::Br, {condB}, s->line);
 
-  curBB_ = bodyB;
+    curBB_ = condB;
+    loops_.push_back({condB, endB});
+    emitCondBr(s->cond.get(), bodyB, endB);
+
+    curBB_ = bodyB;
+    visitStmt(s->body.get());
+    if (!curBB_->hasTerminator()) emitTerm(Op::Br, {condB}, s->line);
+    loops_.pop_back();
+
+    curBB_ = endB;
+    return;
+  }
+
+  // ---- affine layer (top of the mid-end): canonical counting loops ---------
+  // A clean `while (iv < ub) { body; iv = iv + step }` over a local i32 slot
+  // is kept as an affine.for region op so the affine layer can optimise it
+  // (IV-based analysis, unrolling, vectorisation...).  The mid-end pass
+  // lower-affine-to-scf (midend/pass/Passes.cpp) turns it back into the
+  // generic scf.while form for the middle layer.  Everything that does not
+  // match stays scf.while.
+  if (tryEmitAffineFor(s)) return;
+
+  // ---- structured scf.while ----------------------------------------------
+  // Kept in MLIR's scf.while shape, which the printer shows and which later
+  // mid-end passes can exploit:
+  //
+  //   <pre code>
+  //   scf.while {                 // condRegion
+  //     ^cond:  ...cond...        // re-entered every iteration
+  //             scf.condition %c  // true -> body region, false -> exit block
+  //   } do {
+  //     ^body:  ...body...        // bodyRegion
+  //             scf.yield         // back to ^cond
+  //   }
+  //   <exit block>
+  BasicBlock *exitB = newBlock(); // block the loop continues into when done
+  Instruction *op = newInstr(Op::ScfWhile, Type::Void, s->line);
+  op->ops = {exitB};
+
+  // condition region
+  regStack_.push_back(&op->condRegion);
+  BasicBlock *condEntry = newBlock();
+  curBB_ = condEntry;
+  Value *cond = condValue(s->cond.get()); // may open more cond-region blocks
+
+  // body-region entry must exist before scf.condition's targets are fixed
+  regStack_.pop_back();
+  regStack_.push_back(&op->bodyRegion);
+  BasicBlock *bodyEntry = newBlock();
+  regStack_.pop_back();
+
+  Instruction *sc = newInstr(Op::ScfCondition, Type::Void, s->line);
+  sc->ops = {cond, bodyEntry, exitB};
+
+  // body region
+  regStack_.push_back(&op->bodyRegion);
+  curBB_ = bodyEntry;
   visitStmt(s->body.get());
-  if (!curBB_->hasTerminator()) emitTerm(Op::Br, {condB}, s->line);
-  loops_.pop_back();
+  if (!curBB_->hasTerminator()) newInstr(Op::ScfYield, Type::Void, s->line);
+  regStack_.pop_back();
 
-  curBB_ = endB;
+  curBB_ = exitB;
+}
+
+// A `while` is structure-eligible only when its body subtree contains no
+// `return` and no break/continue that would target *this* loop.  Returns and
+// breaks inside a nested while are reported separately: returns still poison
+// the outer loop (they would have to leave every enclosing region), whereas a
+// nested break/continue only makes that inner loop unstructured.
+void IRBuilder::scanLoopTree(StmtNode *n, bool &hasRet, bool &hasOwnBC) {
+  if (!n) return;
+  if (auto *blk = dynamic_cast<BlockStmtNode *>(n)) {
+    for (auto &s : blk->body) scanLoopTree(s.get(), hasRet, hasOwnBC);
+  } else if (auto *ifs = dynamic_cast<IfStmtNode *>(n)) {
+    scanLoopTree(ifs->thenStmt.get(), hasRet, hasOwnBC);
+    scanLoopTree(ifs->elseStmt.get(), hasRet, hasOwnBC);
+  } else if (auto *ws = dynamic_cast<WhileStmtNode *>(n)) {
+    bool r = false, b = false; // b is intentionally dropped here
+    scanLoopTree(ws->body.get(), r, b);
+    hasRet |= r;
+  } else if (dynamic_cast<BreakStmtNode *>(n) ||
+             dynamic_cast<ContinueStmtNode *>(n)) {
+    hasOwnBC = true;
+  } else if (dynamic_cast<ReturnStmtNode *>(n)) {
+    hasRet = true;
+  }
+}
+
+bool IRBuilder::whileIsClean(WhileStmtNode *s) {
+  bool r = false, bc = false;
+  scanLoopTree(s->body.get(), r, bc);
+  return !r && !bc;
+}
+
+// ---- canonical counting loops (affine layer) ------------------------------
+// Helpers shared by the affine.for matcher.  A counting loop is only lifted to
+// affine when every property can be proven syntactically; anything uncertain
+// simply stays in scf.while / cf, which is always a safe fallback.
+
+namespace {
+
+// Does an expression subtree contain a function call?  Used to decide whether
+// a global (or otherwise externally reachable) memory object can change value
+// between iterations.
+bool exprHasCall(const ExprNode *e) {
+  if (!e) return false;
+  if (auto *lv = dynamic_cast<const LValNode *>(e)) {
+    for (auto &ix : lv->indices)
+      if (exprHasCall(ix.get())) return true;
+    return false;
+  }
+  if (auto *un = dynamic_cast<const UnaryExprNode *>(e))
+    return exprHasCall(un->operand.get());
+  if (auto *bn = dynamic_cast<const BinaryExprNode *>(e))
+    return exprHasCall(bn->lhs.get()) || exprHasCall(bn->rhs.get());
+  if (dynamic_cast<const CallExprNode *>(e)) return true;
+  return false;
+}
+
+bool initHasCall(const InitNode *in) {
+  if (!in) return false;
+  if (in->kind == InitNode::EXPR) return exprHasCall(in->expr.get());
+  for (auto &c : in->list)
+    if (initHasCall(c.get())) return true;
+  return false;
+}
+
+} // namespace
+
+bool IRBuilder::stmtTreeHasCall(StmtNode *s) {
+  if (!s) return false;
+  if (auto *blk = dynamic_cast<BlockStmtNode *>(s)) {
+    for (auto &c : blk->body)
+      if (stmtTreeHasCall(c.get())) return true;
+    return false;
+  }
+  if (auto *ds = dynamic_cast<DeclStmtNode *>(s)) {
+    for (auto &d : ds->decl->defs)
+      if (initHasCall(d->init.get())) return true;
+    return false;
+  }
+  if (auto *as = dynamic_cast<AssignStmtNode *>(s))
+    return exprHasCall(as->rhs.get());
+  if (auto *es = dynamic_cast<ExprStmtNode *>(s))
+    return exprHasCall(es->expr.get());
+  if (auto *ifs = dynamic_cast<IfStmtNode *>(s))
+    return exprHasCall(ifs->cond.get()) || stmtTreeHasCall(ifs->thenStmt.get()) ||
+           stmtTreeHasCall(ifs->elseStmt.get());
+  if (auto *ws = dynamic_cast<WhileStmtNode *>(s))
+    return exprHasCall(ws->cond.get()) || stmtTreeHasCall(ws->body.get());
+  if (auto *rs = dynamic_cast<ReturnStmtNode *>(s))
+    return exprHasCall(rs->value.get());
+  return false;
+}
+
+bool IRBuilder::stmtTreeWritesName(StmtNode *s, const std::string &name,
+                                   const StmtNode *skip) {
+  if (!s || s == skip) return false;
+  if (auto *blk = dynamic_cast<BlockStmtNode *>(s)) {
+    for (auto &c : blk->body)
+      if (stmtTreeWritesName(c.get(), name, skip)) return true;
+    return false;
+  }
+  if (auto *ds = dynamic_cast<DeclStmtNode *>(s)) {
+    // A declaration shadowing `name` means all following (inner) writes
+    // concern that new object, but a *write* to it would still change what an
+    // unshadowed read at the same point saw; conservatively reject those.
+    for (auto &d : ds->decl->defs)
+      if (d->name == name) return true;
+    return false;
+  }
+  if (auto *as = dynamic_cast<AssignStmtNode *>(s)) {
+    if (auto *lv = dynamic_cast<LValNode *>(as->lhs.get()))
+      if (lv->name == name) return true;
+    return false;
+  }
+  if (auto *ifs = dynamic_cast<IfStmtNode *>(s)) {
+    if (stmtTreeWritesName(ifs->thenStmt.get(), name, skip)) return true;
+    return stmtTreeWritesName(ifs->elseStmt.get(), name, skip);
+  }
+  if (auto *ws = dynamic_cast<WhileStmtNode *>(s))
+    return stmtTreeWritesName(ws->body.get(), name, skip);
+  return false;
+}
+
+bool IRBuilder::boundIsInvariant(const ExprNode *bound, StmtNode *body,
+                                 const std::string &ivName) {
+  // A compile-time constant can never change between iterations.
+  if (bound->cval.valid) return true;
+  if (bound->isTensorVal || bound->isArrayExpr) return false;
+  if (bound->evalType != TypeCat::INT) return false;
+
+  // The bound must be a plain scalar object read (no subscripts / tensors),
+  // distinct from the induction variable.
+  auto *lv = dynamic_cast<const LValNode *>(bound);
+  if (!lv || !lv->indices.empty()) return false;
+  if (lv->name == ivName) return false;
+
+  Obj *o = lookup(lv->name);
+  if (!o || o->isArray || !o->dims.empty()) return false;
+  if (o->elem != Type::I32) return false;
+
+  // The loop body must never assign the bound: the source re-reads it on
+  // every iteration, the affine form evaluates it exactly once up front.
+  if (stmtTreeWritesName(body, lv->name)) return false;
+
+  // Local slots and parameters are private to this frame, so no call can
+  // touch them; a global scalar is only safe when the body performs no calls.
+  if (dynamic_cast<GlobalVar *>(o->addr)) return !stmtTreeHasCall(body);
+  return true;
+}
+
+bool IRBuilder::matchCountingWhile(WhileStmtNode *s, CountLoop &out) {
+  // Only *clean* loops can be lifted into a structured form at all (no return
+  // and no break/continue that targets this loop).
+  if (!whileIsClean(s)) return false;
+
+  // The condition must be exactly `iv < ub` (or its mirror `ub > iv`), an
+  // int comparison.  Anything else - `<=`, `!=`, compound conditions - is not
+  // a canonical counting loop and stays in the scf layer.
+  auto *cond = dynamic_cast<BinaryExprNode *>(s->cond.get());
+  if (!cond || cond->evalType != TypeCat::INT) return false;
+  LValNode *ivLv = nullptr;
+  ExprNode *bound = nullptr;
+  if (cond->op == BinaryOp::LT) {
+    if (auto *lv = dynamic_cast<LValNode *>(cond->lhs.get())) {
+      ivLv = lv;
+      bound = cond->rhs.get();
+    }
+  } else if (cond->op == BinaryOp::GT) {
+    if (auto *lv = dynamic_cast<LValNode *>(cond->rhs.get())) {
+      ivLv = lv;
+      bound = cond->lhs.get();
+    }
+  }
+  if (!ivLv || !bound) return false;
+  if (ivLv->isTensorVal || !ivLv->indices.empty()) return false;
+  if (ivLv->evalType != TypeCat::INT) return false;
+
+  // The induction variable must be a memory-resident local i32 scalar (the
+  // lowering re-materialises the loop over its slot; globals could be written
+  // by calls and are therefore refused).
+  Obj *o = lookup(ivLv->name);
+  if (!o || o->isArray || o->isConst || !o->dims.empty()) return false;
+  auto *slot = dynamic_cast<Instruction *>(o->addr);
+  if (!slot || slot->op != Op::Alloca || slot->elem != Type::I32) return false;
+
+  // The tail of the loop body must be exactly `iv = iv + K` (K a positive int
+  // constant).  The affine lowering turns it into the loop's step.
+  StmtNode *body = s->body.get();
+  StmtNode *tail = body;
+  if (auto *blk = dynamic_cast<BlockStmtNode *>(body)) {
+    if (blk->body.empty()) return false;
+    tail = blk->body.back().get();
+  }
+  auto *as = dynamic_cast<AssignStmtNode *>(tail);
+  if (!as) return false;
+  auto *lv = dynamic_cast<LValNode *>(as->lhs.get());
+  if (!lv || lv->name != ivLv->name || !lv->indices.empty() ||
+      lv->isTensorVal)
+    return false;
+  auto *incArith = dynamic_cast<BinaryExprNode *>(as->rhs.get());
+  if (!incArith || incArith->op != BinaryOp::ADD) return false;
+  ExprNode *constSide = nullptr;
+  if (auto *al = dynamic_cast<LValNode *>(incArith->lhs.get()))
+    if (al->name == ivLv->name && al->indices.empty())
+      constSide = incArith->rhs.get();
+  if (!constSide)
+    if (auto *ar = dynamic_cast<LValNode *>(incArith->rhs.get()))
+      if (ar->name == ivLv->name && ar->indices.empty())
+        constSide = incArith->lhs.get();
+  if (!constSide || !constSide->cval.valid ||
+      constSide->evalType != TypeCat::INT)
+    return false;
+  int64_t step = constSide->cval.ival;
+  if (step <= 0 || step > (int64_t)INT32_MAX) return false;
+
+  // No other statement in the body may write `iv`: the affine step runs at the
+  // end of *every* iteration and would clobber any other value.
+  if (stmtTreeWritesName(body, ivLv->name, tail)) return false;
+
+  // The upper bound must not change during the loop.
+  if (!boundIsInvariant(bound, body, ivLv->name)) return false;
+
+  out.iv = ivLv->name;
+  out.obj = o;
+  out.bound = bound;
+  out.step = step;
+  return true;
+}
+
+void IRBuilder::emitBodyWithoutTail(StmtNode *body) {
+  auto *blk = dynamic_cast<BlockStmtNode *>(body);
+  if (!blk) return; // the body itself is the increment: nothing to emit
+  pushScope();
+  for (size_t i = 0; i + 1 < blk->body.size(); ++i)
+    visitStmt(blk->body[i].get());
+  popScope();
+}
+
+bool IRBuilder::tryEmitAffineFor(WhileStmtNode *s) {
+  CountLoop cl;
+  if (!matchCountingWhile(s, cl)) return false;
+  if (curBB_->hasTerminator()) curBB_ = newBlock();
+
+  Obj *o = cl.obj;
+  Value *slot = o->addr;
+  int line = s->line;
+
+  // Evaluate the iteration-invariant upper bound exactly once, up front; the
+  // lower bound is whatever the induction slot holds when the loop is entered
+  // (the enclosing code stored the initial value there, if any).
+  Value *ub = visitExpr(cl.bound);
+  Value *lb = emitLoad(slot, Type::I32, line);
+
+  BasicBlock *exitB = newBlock(); // where control continues when the loop ends
+  Instruction *op = newInstr(Op::AffineFor, Type::Void, line);
+  op->ops = {exitB, slot, lb, ub};
+  op->cond = Cond::Lt; // canonical ascending count: iv < ub
+  op->step = cl.step;
+
+  // body region: all loop statements except the trailing increment, which is
+  // re-materialised by the lower-affine-to-scf pass as `iv += step`.
+  regStack_.push_back(&op->bodyRegion);
+  BasicBlock *bodyEntry = newBlock();
+  curBB_ = bodyEntry;
+  emitBodyWithoutTail(s->body.get());
+  if (!curBB_->hasTerminator()) newInstr(Op::AffineYield, Type::Void, line);
+  regStack_.pop_back();
+
+  curBB_ = exitB;
+  return true;
 }
 
 void IRBuilder::visitReturn(ReturnStmtNode *s) {
