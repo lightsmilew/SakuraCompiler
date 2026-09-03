@@ -1,0 +1,118 @@
+// SakuraCompiler driver.
+// Usage: compiler <input.sy> [-S] [-o out.s] [--dump-ir]
+// Runs the full pipeline: lex/parse (ANTLR4) -> AST + semantic analysis ->
+// MLIR-style mid-end IR -> RISC-V instruction selection -> graph-colouring
+// register allocation -> assembly emission.
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+#include "frontend/ASTBuilder.h"
+#include "frontend/generate/SysYLexer.h"
+#include "frontend/generate/SysYParser.h"
+
+#include "backend/Asm.h"
+#include "backend/ISel.h"
+#include "backend/RA.h"
+#include "frontend/SemanticAnalysis.h"
+#include "midend/irbuild/IRBuilder.h"
+
+using namespace antlr4;
+using namespace sakura;
+
+namespace {
+
+// Error listener that throws on the first syntax error so that we can report a
+// clean single error and exit.
+struct Thrower : public BaseErrorListener {
+  void syntaxError(Recognizer *, Token *, size_t line, size_t charPositionInLine,
+                   const std::string &msg, std::exception_ptr) override {
+    throw CompileError("syntax error at line " + std::to_string(line) + ", column " +
+                           std::to_string(charPositionInLine + 1) + ": " + msg,
+                       (int)line);
+  }
+};
+
+std::string readAll(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw CompileError("cannot open input file: " + path);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  std::string inputFile;
+  std::string outFile;
+  bool dumpIr = false;
+  for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a == "--dump-ir") dumpIr = true;
+    else if (a == "-o") {
+      if (i + 1 < argc) outFile = argv[++i];
+    }
+    else if (a == "-S") {
+      // emit assembly (default behaviour)
+    }
+    else inputFile = a;
+  }
+  if (inputFile.empty()) {
+    std::cerr << "usage: compiler <input.sy> [-S] [-o out.s] [--dump-ir]\n";
+    return 1;
+  }
+
+  try {
+    std::string text = readAll(inputFile);
+
+    ANTLRInputStream stream(text);
+    SysYLexer lexer(&stream);
+    lexer.removeErrorListeners();
+    lexer.addErrorListener(new Thrower());
+    CommonTokenStream tokens(&lexer);
+    SysYParser parser(&tokens);
+    parser.removeErrorListeners();
+    parser.addErrorListener(new Thrower());
+    tree::ParseTree *tree = parser.compUnit();
+
+    ASTBuilder builder;
+    auto unit = builder.build(tree);
+
+    // Semantic analysis: resolve scopes / types / constant values and report
+    // semantic errors.
+    SemanticAnalyzer analyzer(unit.get());
+    analyzer.analyze();
+
+    // Mid-end: lower the checked AST into the MLIR-style IR module.
+    auto base = inputFile.substr(inputFile.find_last_of("/\\") + 1);
+    sakura::ir::IRBuilder irb(unit.get(), &analyzer.functions(), base);
+    auto module = irb.run();
+    if (dumpIr) std::cout << module->toString();
+
+    // Back-end: instruction selection + graph-colouring register allocation
+    // + assembly emission.
+    auto fns = sakura::backend::runInstructionSelection(module.get());
+    sakura::backend::runRegisterAlloc(fns);
+    std::string asmText = sakura::backend::emitAssembly(module.get(), fns);
+
+    std::ostream *os = &std::cout;
+    std::ofstream ofs;
+    if (!outFile.empty()) {
+      ofs.open(outFile, std::ios::binary);
+      if (!ofs) throw CompileError("cannot open output file: " + outFile);
+      os = &ofs;
+    }
+    if (!dumpIr) *os << asmText;
+    return 0;
+  } catch (CompileError &e) {
+    std::cerr << "Error" << (e.line > 0 ? " at line " + std::to_string(e.line) : "")
+              << ": " << e.what() << "\n";
+    return 1;
+  } catch (std::exception &e) {
+    std::cerr << "internal error: " << e.what() << "\n";
+    return 1;
+  }
+}

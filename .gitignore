@@ -1,0 +1,5 @@
+cases/*
+build/
+vm/
+*.o
+*.elf
