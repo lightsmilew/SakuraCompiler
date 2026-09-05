@@ -57,6 +57,10 @@ public:
   std::unordered_map<const Value *, PtrVal> ptrs;
   std::unordered_map<const Instruction *, int64_t> frOff;
   std::unordered_set<const Instruction *> liveAlloca;
+  // phi instructions per block (cf.phi), used to place register copies at
+  // the end of every predecessor block.
+  std::unordered_map<const BasicBlock *, std::vector<Instruction *>> blockPhis;
+  std::unordered_map<const Value *, int32_t> phiRegs; // phi -> its vreg
 
   int nextReg = 0;
   int nextFrameByte = 0;
@@ -78,6 +82,8 @@ public:
   int32_t forceReg(Value *v, int line) {
     auto it = vreg.find(v);
     if (it != vreg.end()) return it->second;
+    if (auto *pi = dynamic_cast<Instruction *>(v))
+      if (pi->op == Op::Phi) return phiRegs.at(pi); // bound in the pre-scan
     MInst m;
     if (auto *ci = dynamic_cast<ConstantInt *>(v)) {
       m.op = MOp::Li;
@@ -95,7 +101,14 @@ public:
       emit(m);
       return vreg[v] = m.dst;
     }
-    throw CompileError("internal: unbound value in instruction selection",
+    std::string desc = "?";
+    if (auto *inst = dynamic_cast<Instruction *>(v))
+      desc = "inst op=" + std::to_string((int)inst->op) +
+             " line=" + std::to_string(inst->line);
+    else if (dynamic_cast<Argument *>(v)) desc = "argument";
+    else if (dynamic_cast<GlobalVar *>(v)) desc = "global";
+    throw CompileError("internal: unbound value in instruction selection [" +
+                           desc + "]",
                        line);
   }
 
@@ -325,6 +338,9 @@ void lowerInstruction(FnLower &L, Instruction *i) {
   switch (i->op) {
   case Op::Alloca:
     return; // slot assigned lazily on first use
+  case Op::Phi:
+    return; // a pure merge: the vreg was bound in the pre-scan and the
+            // incoming copies are emitted at the predecessors' terminators
   case Op::Load: {
     PtrVal &p = L.ptrOf(i->ops[0]);
     MInst m;
@@ -560,6 +576,121 @@ void lowerInstruction(FnLower &L, Instruction *i) {
 void lowerTerminator(FnLower &L, BasicBlock *bb, size_t bi) {
   Instruction *t = bb->instrs.back().get();
   int line = t->line;
+
+  // cf.phi lowering: a successor block may need the value this block feeds
+  // into each of its phis.  The copy lands at the end of *this* block, so on
+  // a loop back edge it is exactly the "phi copy" a register-allocated loop
+  // counter needs.  Copies are emitted for every branch target; a copy whose
+  // destination is never reached on the taken path only writes a dead vreg
+  // (its phi block is only ever read through this or another predecessor's
+  // copy), so this is safe even without edge splitting.
+  //
+  // The phis of one target execute SIMULTANEOUSLY (SSA merge semantics): when
+  // they feed each other across the edge - the A=D;D=C;C=B;temp rotation of a
+  // register-rotation loop - emitting them in declaration order reads a vreg
+  // that an earlier copy has already overwritten.  They are therefore
+  // scheduled like parallel copies: a copy is emitted only once its
+  // destination is no longer read by a still-pending copy, and a remaining
+  // pure cycle is broken through a fresh scratch vreg that captures the
+  // pre-copy value its readers expect.
+  auto emitPhiCopies = [&](BasicBlock *target) {
+    auto it = L.blockPhis.find(target);
+    if (it == L.blockPhis.end()) return;
+    struct Copy {
+      int32_t dst = -1, src = -1;
+      bool isConst = false, isF = false;
+      int32_t imm = 0;
+    };
+    std::vector<Copy> P;
+    P.reserve(it->second.size());
+    for (Instruction *ph : it->second) {
+      Value *val = nullptr;
+      for (size_t k = 0; k + 1 < ph->ops.size(); k += 2)
+        if (ph->ops[k] == (Value *)bb) {
+          val = ph->ops[k + 1];
+          break;
+        }
+      if (!val) continue;
+      int32_t dst = L.phiRegs.at(ph);
+      bool isF = ph->ty == Type::F32;
+      Copy c;
+      c.dst = dst;
+      c.isF = isF;
+      if (auto *ci = dynamic_cast<ConstantInt *>(val)) {
+        c.isConst = true;
+        c.imm = ci->v;
+      } else if (auto *cf = dynamic_cast<ConstantFloat *>(val)) {
+        c.isConst = true;
+        c.imm = (int32_t)cf->bits();
+        c.isF = true;
+      } else {
+        c.src = L.forceReg(val, line);
+        if (c.src == dst) continue; // self copy: nothing to do
+      }
+      P.push_back(c);
+    }
+    auto emitCopy = [&](const Copy &c) {
+      MInst m;
+      m.line = line;
+      if (c.isConst) {
+        m.op = c.isF ? MOp::LiF : MOp::Li;
+        m.dst = c.dst;
+        m.imm = c.imm;
+        m.ty = c.isF ? Type::F32 : Type::I32;
+      } else {
+        m.op = c.isF ? MOp::MoveF : MOp::MoveX;
+        m.dst = c.dst;
+        m.a = c.src;
+        m.ty = c.isF ? Type::F32 : Type::I32;
+      }
+      L.emit(m);
+    };
+    std::vector<char> done(P.size(), 0);
+    size_t remaining = P.size();
+    auto dstReadLater = [&](int32_t d) {
+      for (size_t j = 0; j < P.size(); ++j)
+        if (!done[j] && !P[j].isConst && P[j].src == d) return true;
+      return false;
+    };
+    while (remaining > 0) {
+      size_t pick = P.size();
+      for (size_t i = 0; i < P.size(); ++i) {
+        if (done[i]) continue;
+        if (!dstReadLater(P[i].dst)) {
+          pick = i;
+          break;
+        }
+      }
+      if (pick != P.size()) { // leaf: safe to emit now
+        emitCopy(P[pick]);
+        done[pick] = 1;
+        --remaining;
+        continue;
+      }
+      // every remaining destination is read by a remaining copy: pure cycles
+      // (e.g. an A<->B swap).  Preserve one destination's pre-copy value in a
+      // fresh scratch, redirect its readers, then overwrite it.
+      size_t i = 0;
+      while (done[i]) ++i;
+      Copy &c = P[i];
+      int32_t tmp = L.newReg();
+      {
+        MInst m;
+        m.op = c.isF ? MOp::MoveF : MOp::MoveX;
+        m.dst = tmp;
+        m.a = c.dst; // the vreg's current (pre-copy) value
+        m.ty = c.isF ? Type::F32 : Type::I32;
+        m.line = line;
+        L.emit(m);
+      }
+      for (size_t j = 0; j < P.size(); ++j)
+        if (!done[j] && j != i && P[j].src == c.dst) P[j].src = tmp;
+      emitCopy(c);
+      done[i] = 1;
+      --remaining;
+    }
+  };
+
   BasicBlock *nextBB =
       (bi + 1 < L.fn->blocks.size()) ? L.fn->blocks[bi + 1].get() : nullptr;
   std::string nextL = nextBB ? L.labelFor(nextBB) : std::string();
@@ -576,7 +707,9 @@ void lowerTerminator(FnLower &L, BasicBlock *bb, size_t bi) {
   };
 
   if (t->op == Op::Br) {
-    jmp(dynamic_cast<BasicBlock *>(t->ops[0]));
+    auto *target = dynamic_cast<BasicBlock *>(t->ops[0]);
+    emitPhiCopies(target);
+    jmp(target);
     return;
   }
   if (t->op == Op::Ret) {
@@ -602,6 +735,10 @@ void lowerTerminator(FnLower &L, BasicBlock *bb, size_t bi) {
   Value *cond = t->ops[0];
   auto *thenB = dynamic_cast<BasicBlock *>(t->ops[1]);
   auto *elseB = dynamic_cast<BasicBlock *>(t->ops[2]);
+  // incoming phi values for both arms (see the note above: emitted before the
+  // conditional branch, which is safe without edge splitting)
+  emitPhiCopies(thenB);
+  if (elseB != thenB) emitPhiCopies(elseB);
   std::string thenL = L.labelFor(thenB), elseL = L.labelFor(elseB);
 
   if (auto *ci = dynamic_cast<ConstantInt *>(cond)) {
@@ -647,39 +784,54 @@ std::vector<int32_t> countUses(FnLower &L) {
 }
 
 // compare materialization immediately followed by a test on its result can be
-// replaced by a single conditional branch.
+// replaced by a single conditional branch.  Phi copies emitted between the
+// compare and the branch (mem2reg) are transparent: we scan back across pure
+// move/load-immediate instructions that do not feed the branch operand.
 void fuseBranchCompares(FnLower &L) {
   auto use = countUses(L);
+  auto transparent = [](const MInst &m) {
+    return m.op == MOp::MoveX || m.op == MOp::MoveF || m.op == MOp::Li ||
+           m.op == MOp::LiF;
+  };
   for (auto &b : L.mf.blocks) {
     auto &v = b.instrs;
     for (size_t i = 0; i < v.size();) {
       MInst &m = v[i];
       bool branchOnTrue = m.op == MOp::BrNz; // jump sym when cond != 0
       if (branchOnTrue || m.op == MOp::BrZ) {
-        if (i >= 1 && v[i - 1].op == MOp::ICmp &&
-            v[i - 1].dst == m.a && use[(size_t)m.a] == 1) {
-          Cond c = (Cond)v[i - 1].imm;
+        // scan back over transparent instructions to find the compare
+        long long j = (long long)i - 1;
+        while (j >= 0 && transparent(v[(size_t)j]) &&
+               v[(size_t)j].dst != m.a && v[(size_t)j].a != m.a)
+          --j;
+        if (j >= 0 && v[(size_t)j].op == MOp::ICmp &&
+            v[(size_t)j].dst == m.a && use[(size_t)m.a] == 1) {
+          Cond c = (Cond)v[(size_t)j].imm;
           if (!branchOnTrue) c = invertCond(c);
           m.op = MOp::BrCmp;
-          m.a = v[i - 1].a;
-          m.b = v[i - 1].b;
+          m.a = v[(size_t)j].a;
+          m.b = v[(size_t)j].b;
           m.imm = (int32_t)c;
-          v.erase(v.begin() + (i - 1));
+          v.erase(v.begin() + j);
           --i;
           continue;
         }
         // compare then xor 1 (logical not of a comparison)
-        if (i >= 2 && v[i - 1].op == MOp::IXorI && v[i - 1].imm == 1 &&
-            v[i - 1].dst == m.a && use[(size_t)m.a] == 1 &&
-            v[i - 2].op == MOp::ICmp && v[i - 2].dst == v[i - 1].a &&
-            use[(size_t)v[i - 1].a] == 1) {
-          Cond c = (Cond)v[i - 2].imm;
+        if (j >= 1 && v[(size_t)j].op == MOp::IXorI &&
+            v[(size_t)j].imm == 1 && v[(size_t)j].dst == m.a &&
+            use[(size_t)m.a] == 1 && v[(size_t)j - 1].op == MOp::ICmp &&
+            v[(size_t)j - 1].dst == v[(size_t)j].a &&
+            use[(size_t)v[(size_t)j].a] == 1) {
+          Cond c = (Cond)v[(size_t)j - 1].imm;
           if (branchOnTrue) c = invertCond(c);
           m.op = MOp::BrCmp;
-          m.a = v[i - 2].a;
-          m.b = v[i - 2].b;
+          m.a = v[(size_t)j - 1].a;
+          m.b = v[(size_t)j - 1].b;
           m.imm = (int32_t)c;
-          v.erase(v.begin() + (i - 2), v.begin() + i);
+          // remove the xor and the compare but keep any transparent phi
+          // copies that sit between them and the branch.
+          v.erase(v.begin() + j);      // xor
+          v.erase(v.begin() + (j - 1)); // compare
           i -= 2;
           continue;
         }
@@ -691,7 +843,7 @@ void fuseBranchCompares(FnLower &L) {
 
 } // namespace
 
-std::vector<MachineFunc> runInstructionSelection(Module *mod) {
+std::vector<MachineFunc> InstructionSelector::select(Module *mod) {
   // The mid-end contract: the back-end only ever consumes flat cf IR.  This
   // is enforced by the verify-cf-only pass in runMidEndPipeline(); the check
   // here makes the boundary hold even if a future driver bypasses the
@@ -711,6 +863,18 @@ std::vector<MachineFunc> runInstructionSelection(Module *mod) {
     L.mf.ret = fn->ret;
     for (auto &p : fn->params) L.mf.params.push_back(p.ty);
     markLiveAllocas(L);
+
+    // Bind every cf.phi to a fresh virtual register up front: a predecessor
+    // block can be emitted before the block that owns the phi (loop back
+    // edges), so the copy source/destination vregs must exist by then.  The
+    // phi itself produces no machine instruction - predecessors write its
+    // vreg and the phi block reads it.
+    for (auto &bb : fn->blocks)
+      for (auto &iu : bb->instrs)
+        if (iu->op == Op::Phi) {
+          L.phiRegs[iu.get()] = L.newReg();
+          L.blockPhis[bb.get()].push_back(iu.get());
+        }
 
     for (size_t bi = 0; bi < fn->blocks.size(); ++bi) {
       BasicBlock *bb = fn->blocks[bi].get();

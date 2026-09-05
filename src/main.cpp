@@ -8,12 +8,16 @@
 // main only wires the three high-level stages together:
 //   * front-end : ASTBuilder + SemanticAnalysis  (input.sy -> typed AST)
 //   * mid-end   : IRBuilder -> runMidEndPipeline (AST -> pure-cf IR)
-//   * back-end  : ISel -> RA -> Asm              (pure-cf IR -> .s)
+//   * back-end  : RISCVBackend::run             (pure-cf IR -> .s)
 // runMidEndPipeline() (midend/pass/Pipeline.h) owns the PassManager and every
-// IR conversion/optimisation pass; the driver never assembles passes itself.
-// Its LayerView hook prints the module at each layer boundary, which backs
-// the --dump-affine / --dump-scf / --dump-cf flags (--dump-ir prints all
-// three and skips assembly emission).
+// IR conversion/optimisation pass; the RISCVBackend class (backend/Pipeline.h)
+// owns instruction selection, the machine peephole/scheduler, register
+// allocation, the post-allocation redundant-move peephole and assembly
+// emission.  The driver never assembles passes or calls back-end stages
+// itself.  The pipeline hooks print the module at each layer boundary and the
+// per-stage pass reports, which back the --dump-affine / --dump-scf /
+// --dump-cf / --pass-stats flags (--dump-ir prints all three layer views and
+// skips assembly emission).
 
 #include <fstream>
 #include <iostream>
@@ -24,9 +28,7 @@
 #include "frontend/generate/SysYLexer.h"
 #include "frontend/generate/SysYParser.h"
 
-#include "backend/Asm.h"
-#include "backend/ISel.h"
-#include "backend/RA.h"
+#include "backend/Pipeline.h"
 #include "frontend/SemanticAnalysis.h"
 #include "midend/irbuild/IRBuilder.h"
 #include "midend/pass/Pipeline.h"
@@ -62,12 +64,20 @@ int main(int argc, char **argv) {
   std::string outFile;
   bool dumpIr = false;       // dump all three layer views, suppress assembly
   bool dumpAffine = false, dumpScf = false, dumpCf = false;
+  bool dumpFinal = false;    // dump the module right before the back-end
+  bool passStats = false;
+  sakura::ir::OptLevel optLevel = sakura::ir::OptLevel::O2; // default: on
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--dump-ir") dumpIr = true;
     else if (a == "--dump-affine") dumpAffine = true;
     else if (a == "--dump-scf") dumpScf = true;
     else if (a == "--dump-cf") dumpCf = true;
+    else if (a == "--dump-final") dumpFinal = true;
+    else if (a == "--pass-stats") passStats = true;
+    else if (a == "-O0") optLevel = sakura::ir::OptLevel::O0;
+    else if (a == "-O1") optLevel = sakura::ir::OptLevel::O1;
+    else if (a == "-O2") optLevel = sakura::ir::OptLevel::O2;
     else if (a == "-o") {
       if (i + 1 < argc) outFile = argv[++i];
     }
@@ -77,7 +87,8 @@ int main(int argc, char **argv) {
     else inputFile = a;
   }
   if (inputFile.empty()) {
-    std::cerr << "usage: compiler <input.sy> [-S] [-o out.s] [--dump-ir]\n";
+    std::cerr << "usage: compiler <input.sy> [-S] [-o out.s] [-O0|-O1|-O2]"
+                 " [--dump-ir] [--pass-stats]\n";
     return 1;
   }
 
@@ -120,15 +131,22 @@ int main(int argc, char **argv) {
           if (show)
             std::cout << "// ===== " << layer << " layer =====\n"
                       << m.toString();
-        });
+        },
+        optLevel, passStats ? &std::cout : nullptr);
 
     // ---- back-end: pure-cf IR -> RISC-V assembly -----------------------------
     // The module is guaranteed to contain only cf / func / arith / memref ops
-    // (verified inside the mid-end pipeline).  Instruction selection + graph-
-    // colouring register allocation + assembly emission.
-    auto fns = sakura::backend::runInstructionSelection(module.get());
-    sakura::backend::runRegisterAlloc(fns);
-    std::string asmText = sakura::backend::emitAssembly(module.get(), fns);
+    // (verified inside the mid-end pipeline).  runBackendPipeline runs the
+    // whole back-end internally - instruction selection, the block-local
+    // peephole + load scheduler (kept off at -O0), register allocation and
+    // assembly emission - and returns the final .s text.
+    if (dumpFinal)
+      std::cout << "// ===== final (pre-ISel) =====\n" << module->toString();
+    sakura::backend::BackendOptions bopts;
+    bopts.machineOpt = (optLevel != sakura::ir::OptLevel::O0);
+    bopts.stats = passStats ? &std::cout : nullptr;
+    sakura::backend::RISCVBackend backend;
+    std::string asmText = backend.run(module.get(), bopts);
 
     std::ostream *os = &std::cout;
     std::ofstream ofs;

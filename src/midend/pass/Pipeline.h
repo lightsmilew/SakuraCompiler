@@ -24,11 +24,17 @@
 #pragma once
 
 #include <functional>
+#include <iosfwd>
 
 #include "../ir/IR.h"
 
 namespace sakura {
 namespace ir {
+
+// Optimisation budget.  O0 keeps the historical conversion-only pipeline
+// (useful as a correctness baseline); O1/O2 enable the ported optimisation
+// passes (O2 = default, strongest).
+enum class OptLevel : uint8_t { O0, O1, O2 };
 
 // Optional per-layer view hook.  Invoked with the layer name ("affine" /
 // "scf" / "cf") and the module every time the pipeline enters a layer, i.e.
@@ -40,7 +46,12 @@ using LayerView = std::function<void(const char *layer, Module &mod)>;
 // every conversion and optimisation pass through an internal PassManager.
 // After the call returns, the module contains only cf / func / arith /
 // memref ops (guaranteed by the trailing verify-cf-only pass).
-void runMidEndPipeline(Module &mod, const LayerView &view = nullptr);
+//
+// When `stats` is non-null, a one-line "<pass>: changed/unchanged" report is
+// written after the pipeline has run (driven by --pass-stats).
+void runMidEndPipeline(Module &mod, const LayerView &view = nullptr,
+                       OptLevel level = OptLevel::O2,
+                       std::ostream *stats = nullptr);
 
 } // namespace ir
 } // namespace sakura

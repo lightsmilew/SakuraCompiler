@@ -106,6 +106,7 @@ Dialect dialectOf(Op o) {
     return Dialect::Func;
   case Op::Br:
   case Op::CondBr:
+  case Op::Phi:
     return Dialect::Cf;
   case Op::ScfWhile:
   case Op::ScfCondition:
@@ -135,6 +136,7 @@ const char *opMnemonic(Op o) {
   case Op::Call:   return "call";
   case Op::Br:     return "br";
   case Op::CondBr: return "cond_br";
+  case Op::Phi:    return "phi";
   case Op::ScfWhile:    return "while";
   case Op::ScfCondition:return "condition";
   case Op::ScfYield:    return "yield";
@@ -458,6 +460,17 @@ std::string Module::toString() {
         }
         case Op::Br: {
           os << "cf.br " << nameOf(inst->ops[0]);
+          break;
+        }
+        case Op::Phi: {
+          // ops = [pred0, value0, pred1, value1, ...]
+          os << "cf.phi ";
+          for (size_t k = 0; k + 1 < inst->ops.size(); k += 2) {
+            if (k) os << ", ";
+            os << "[" << nameOf(inst->ops[k + 1]) << ", "
+               << nameOf(inst->ops[k]) << "]";
+          }
+          os << " : " << typeStr(inst->ty);
           break;
         }
         case Op::CondBr: {

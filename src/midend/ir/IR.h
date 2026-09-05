@@ -74,6 +74,13 @@ enum class Op : uint8_t {
 
   // cf dialect (unstructured control flow, the bottom layer)
   Br,   CondBr,                   // cf.br / cf.cond_br
+  // cf.phi - SSA merge point introduced by mem2reg (register promotion).
+  // Result is the merge value (i32/f32); ops is a flat list of
+  // [predBlock0, value0, predBlock1, value1, ...], one entry per CFG
+  // predecessor of the block.  The block's phis sit at the head of its
+  // instruction list.  Instruction selection lowers each phi to register
+  // copies at the end of every predecessor.
+  Phi,
 
   // scf dialect (middle layer): structured loops that are not countable.
   // scf.while is a region op: it owns its condition blocks (condRegion,

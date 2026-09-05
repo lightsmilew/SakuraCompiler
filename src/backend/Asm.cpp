@@ -620,7 +620,7 @@ void emitGlobal(std::ostringstream &os, const GlobalVar &g) {
 
 } // namespace
 
-std::string emitAssembly(Module *mod, std::vector<MachineFunc> &fns) {
+std::string AssemblyWriter::write(Module *mod, std::vector<MachineFunc> &fns) {
   std::ostringstream os;
   os << "\t.text\n";
   for (auto &f : fns) emitFunction(os, f);

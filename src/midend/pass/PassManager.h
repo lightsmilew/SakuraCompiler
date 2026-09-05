@@ -29,6 +29,7 @@
 
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "../ir/IR.h"
@@ -72,6 +73,11 @@ public:
     passes_.push_back(std::move(pass));
   }
 
+  // Per-pass outcome, in execution order (name, changed).
+  const std::vector<std::pair<std::string, bool>> &results() const {
+    return results_;
+  }
+
   // Execute all registered passes in order.  The module must start in the
   // affine layer (i.e. straight out of IRBuilder).  Returns true if any pass
   // modified the IR.
@@ -79,6 +85,7 @@ public:
 
 private:
   std::vector<std::unique_ptr<Pass>> passes_;
+  std::vector<std::pair<std::string, bool>> results_;
   LayerPrinter printer_;
 };
 

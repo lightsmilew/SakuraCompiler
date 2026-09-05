@@ -536,7 +536,7 @@ struct Allocator {
 } // namespace
 
 // ---------------------------------------------------------------------------
-void runRegisterAlloc(std::vector<MachineFunc> &fns) {
+void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
   for (auto &f : fns) {
     Allocator A(f);
     A.trimDead();

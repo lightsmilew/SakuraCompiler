@@ -81,10 +81,14 @@ private:
     return p;
   }
 
-  // Create a stack slot holding one i32 (induction variable / accumulator).
-  Instruction *emitSlot(BasicBlock *bb, int line) {
+  // Create a stack slot holding one scalar.  Loop induction variables are
+  // i32, but a reduction accumulator carries the tensor's element type
+  // (e.g. an f32 matmul accumulator) -- stamping every slot i32 leaves a
+  // float slot whose loads/stores are f32 while the alloca claims i32, which
+  // misleads later scalar passes (mem2reg types its phis from alloca->elem).
+  Instruction *emitSlot(BasicBlock *bb, int line, Type elem = Type::I32) {
     Instruction *s = emitTo(bb, Op::Alloca, Type::Ptr, line);
-    s->elem = Type::I32;
+    s->elem = elem;
     s->n = 1;
     return s;
   }
@@ -304,7 +308,7 @@ private:
     Instruction *si = emitSlot(b, line);
     Instruction *sj = emitSlot(b, line);
     Instruction *sk = emitSlot(b, line);
-    Instruction *sac = emitSlot(b, line);
+    Instruction *sac = emitSlot(b, line, elem);
     ConstantInt *c4 = mod_->constInt(4);
 
     // i loop (its exit is `exit`, the block that followed the matmul)
