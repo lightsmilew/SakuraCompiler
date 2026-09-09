@@ -42,6 +42,7 @@ enum class MOp : uint8_t {
 
   // constant materialisation
   Li,            // dst(X) = imm (i32)
+  LiWide,        // dst(X) = cst (i64 - full 64-bit constant)
   LiF,           // dst(F) = imm (f32 bit pattern)
 
   // entry parameter reads (imm = parameter ordinal)
@@ -55,6 +56,13 @@ enum class MOp : uint8_t {
   ISub,          // dst = a - b
   INeg,          // dst = -a
   IMul, IDiv, IRem,
+  Mulh,          // dst = high 64 bits of a * b (signed 64x64, raw result)
+  // 32-bit word shifts (slliw/srliw/sraiw): canonical sign-extended results,
+  // shift amount in imm (0..31).
+  SllI, SrlI, SraI,
+  // full 64-bit shifts (slli/srli/srai), shift amount in imm (0..63).  The
+  // result is a raw 64-bit value (no i32 sign-extension guarantee).
+  Shl64I, Shr64I, Sar64I,
   IXor, IXorI,   // dst = a ^ b | a ^ imm
   ISlt,          // dst = (a < b) signed
   ISlti,         // dst = (a < imm)
@@ -101,6 +109,7 @@ struct MInst {
   int32_t a = -1;     // first use vreg
   int32_t b = -1;     // second use vreg
   int32_t imm = 0;    // displacement / cond / param ordinal / imm value
+  int64_t cst = 0;    // 64-bit constant (MOp::LiWide only)
   Type ty = Type::I32; // type of the primary def/use value
   std::string sym;  // label / global / callee
   std::vector<MArg> args; // call arguments

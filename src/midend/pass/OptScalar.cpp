@@ -157,7 +157,7 @@ private:
             if (foldList(mod, inst->bodyRegion)) sweep = true;
             continue;
           }
-          switch (foldOne(mod, inst, eraseSet)) {
+          switch (foldOne(mod, list, bb.get(), inst, eraseSet)) {
           case FoldErased:
             any = true;
             sweep = true;
@@ -215,7 +215,8 @@ private:
   // Returns what foldList must do with `inst`.  Erasures are *deferred*:
   // when the fold makes `inst` dead, its uses are rewritten immediately and
   // the pointer is recorded in `eraseSet` for the phase-2 sweep.
-  Fold foldOne(Module &mod, Instruction *inst,
+  Fold foldOne(Module &mod, BlockList &list, BasicBlock *owner,
+               Instruction *inst,
                std::unordered_set<Instruction *> &eraseSet) {
     Op op = inst->op;
 
@@ -227,6 +228,8 @@ private:
         inst->op = Op::Br;
         inst->ops = {target};
         inst->cond = Cond::Eq;
+        // the other arm's edge disappeared: keep phis in sync with the CFG
+        pruneStalePhiPred(list, owner);
         return FoldKept;
       }
       return FoldNone;
@@ -240,6 +243,7 @@ private:
         inst->op = Op::Br;
         inst->ops = {inst->ops[2]}; // -> exit
         inst->cond = Cond::Eq;
+        pruneStalePhiPred(list, owner);
         return FoldKept;
       }
       return FoldNone;
@@ -255,6 +259,7 @@ private:
         inst->ops = {inst->ops[0]};
         inst->cond = Cond::Eq;
         inst->step = 0;
+        pruneStalePhiPred(list, owner);
         return FoldKept;
       }
       return FoldNone;

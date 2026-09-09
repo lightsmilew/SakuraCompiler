@@ -38,6 +38,11 @@ int countUses(Module &mod, Value *v);
 // Redirect every operand equal to `from` to `to` (SSA use replacement).
 void replaceAllUses(Module &mod, Value *from, Value *to);
 
+// A block whose terminator was rewritten may have lost an edge: drop every
+// cf.phi input (in `list`) keyed on it that no live edge supports, keeping
+// phi input lists in sync with the real predecessor edges.
+void pruneStalePhiPred(BlockList &list, BasicBlock *p);
+
 // Side-effect classification (see file comment for the memory model).
 bool isPure(Op o);              // no side effects: safe to delete if unused
 bool isMemoryRead(Op o);        // memref.load

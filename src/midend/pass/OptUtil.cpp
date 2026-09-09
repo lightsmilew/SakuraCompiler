@@ -3,6 +3,8 @@
 
 #include <cmath>
 
+#include <unordered_set>
+
 namespace sakura {
 namespace ir {
 
@@ -72,6 +74,51 @@ void replaceAllUses(Module &mod, Value *from, Value *to) {
   for (Instruction *inst : collectInstrs(mod))
     for (auto &o : inst->ops)
       if (o == from) o = to;
+}
+
+// A block `p` whose terminator was just rewritten (e.g. a constant-armed
+// cond_br folded to a plain br) may have lost an edge to a successor.  Every
+// cf.phi distinguishes its incoming values by predecessor block, so a phi
+// input keyed on `p` at a block `p` no longer branches to is now a stale key
+// that would corrupt later edge-based rewrites (thunk collapsing re-keys such
+// entries onto `p`, merging two values onto one predecessor).  Drop them.
+void pruneStalePhiPred(BlockList &list, BasicBlock *p) {
+  if (!p) return;
+  // blocks p's current terminator still branches to
+  std::unordered_set<BasicBlock *> targets;
+  if (!p->instrs.empty()) {
+    Instruction *last = p->instrs.back().get();
+    auto push = [&](Value *v) {
+      if (auto *b = dynamic_cast<BasicBlock *>(v)) targets.insert(b);
+    };
+    switch (last->op) {
+    case Op::Br:
+      push(last->ops[0]);
+      break;
+    case Op::CondBr:
+      if (last->ops.size() >= 3) {
+        push(last->ops[1]);
+        push(last->ops[2]);
+      }
+      break;
+    default:
+      break; // ret / region terminator: p keeps no outgoing edges
+    }
+  }
+  for (auto &bb : list) {
+    if (bb.get() == p) continue;
+    for (auto &iu : bb->instrs) {
+      Instruction *phi = iu.get();
+      if (phi->op != Op::Phi) continue;
+      for (size_t s = 0; s + 1 < phi->ops.size();) {
+        if (phi->ops[s] == (Value *)p && !targets.count(bb.get()))
+          phi->ops.erase(phi->ops.begin() + (long)s,
+                         phi->ops.begin() + (long)s + 2);
+        else
+          s += 2;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

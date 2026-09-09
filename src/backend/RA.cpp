@@ -117,12 +117,15 @@ struct Allocator {
           OpSlots sl = slots(m);
           bool pure = false;
           switch (m.op) {
-          case MOp::Li: case MOp::LiF: case MOp::MoveX: case MOp::MoveF:
+          case MOp::Li: case MOp::LiWide: case MOp::LiF: case MOp::MoveX:
+          case MOp::MoveF:
           case MOp::LeaFrame: case MOp::LeaGlobal:
           case MOp::EntryInt: case MOp::EntryFlt:
           case MOp::EntryStkInt: case MOp::EntryStkFlt:
           case MOp::IAdd: case MOp::IAddI: case MOp::ISub: case MOp::INeg:
-          case MOp::IMul: case MOp::IDiv: case MOp::IRem:
+          case MOp::IMul: case MOp::IDiv: case MOp::IRem: case MOp::Mulh:
+          case MOp::SllI: case MOp::SrlI: case MOp::SraI:
+          case MOp::Shl64I: case MOp::Shr64I: case MOp::Sar64I:
           case MOp::IXor: case MOp::IXorI:
           case MOp::ISlt: case MOp::ISlti: case MOp::ISltu: case MOp::ISltiu:
           case MOp::ISltuZ: case MOp::ICmp: case MOp::FCmp:
@@ -540,18 +543,6 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
   for (auto &f : fns) {
     Allocator A(f);
     A.trimDead();
-    if (getenv("SAKURA_DUMP_RA")) {
-      fprintf(stderr, "== func %s ==\n", f.name.c_str());
-      for (auto &b : f.blocks) {
-        fprintf(stderr, "-- block %s --\n", b.name.c_str());
-        for (auto &m : b.instrs) {
-          fprintf(stderr, "  op=%-3d dst=%d a=%d b=%d imm=%d sym=%s args=[",
-                  (int)m.op, m.dst, m.a, m.b, m.imm, m.sym.c_str());
-          for (auto &x : m.args) fprintf(stderr, "%d ", x.vreg);
-          fprintf(stderr, "]\n");
-        }
-      }
-    }
     A.nreg = A.maxReg();
     A.buildCFG();
 
@@ -574,18 +565,6 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
                              kXCalleePhys, kXCallee, kXFullPhys, kXFull);
       bool okF = A.colorFile(A.fNodes, A.adjF, crossing, fF, cF,
                              kFCalleePhys, kFCallee, kFFullPhys, kFFull);
-      if (getenv("SAKURA_DUMP_RA")) {
-        fprintf(stderr, "-- colors round %d (okX=%d okF=%d)\n", round, okX,
-                okF);
-        for (size_t i = 0; i < A.xNodes.size(); ++i) {
-          int32_t r = A.xNodes[i];
-          fprintf(stderr, "  x%-3d -> %d\n", r, cX[(size_t)r]);
-          fprintf(stderr, "    neighbors:");
-          for (size_t j = 0; j < A.xNodes.size(); ++j)
-            if (A.adjX[i][j]) fprintf(stderr, " x%d", A.xNodes[j]);
-          fprintf(stderr, "\n");
-        }
-      }
       if (okX && okF) {
         for (int32_t r = 0; r < n; ++r)
           color[(size_t)r] = cX[(size_t)r] >= 0 ? cX[(size_t)r] : cF[(size_t)r];

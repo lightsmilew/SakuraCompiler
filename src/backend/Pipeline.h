@@ -13,6 +13,8 @@
 //       InstructionSelector::select   (IR op -> RISC-V MInst on virtual regs)
 //       MachineOptimizer::peephole    (block-local peephole; off at O0)
 //       MachineOptimizer::schedule    (load hoisting within segments; off at O0)
+//       MachineOptimizer::blockLocalCse (block-local CSE; off at O0)
+//       MachineOptimizer::licm        (machine-level LICM; off at O0)
 //       RegisterAllocator::allocate   (graph-colouring + spills)
 //       MachineOptimizer::removeRedundantMoves (post-RA move elimination)
 //       AssemblyWriter::write         (coloured machine IR + globals -> .s)
@@ -56,9 +58,9 @@ public:
 
 private:
   InstructionSelector isel_;  // stage 1: cf IR -> machine IR (virtual regs)
-  MachineOptimizer opt_;      // stages 2/3/5: pre-RA peephole/schedule + post-RA moves
-  RegisterAllocator ra_;      // stage 4: colour virtual regs (with spills)
-  AssemblyWriter writer_;     // stage 6: machine IR + globals -> .s
+  MachineOptimizer opt_;      // stages 2..5: pre-RA peephole/schedule/blockcse/licm + post-RA moves
+  RegisterAllocator ra_;      // stage 6: colour virtual regs (with spills)
+  AssemblyWriter writer_;     // stage 7: machine IR + globals -> .s
 };
 
 } // namespace backend

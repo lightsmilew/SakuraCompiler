@@ -15,12 +15,16 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
   // the verify-cf-only contract, in case a future driver bypasses it).
   std::vector<MachineFunc> fns = isel_.select(mod);
 
-  // ---- 2) machine-level optimisation (peephole + scheduling) -----------
+  // ---- 2) machine-level optimisation (peephole / schedule / CSE / LICM) --
   // Runs on virtual registers before allocation; off for the -O0 baseline.
-  size_t peephole = 0, scheduled = 0, postra = 0;
+  size_t sr = 0, peephole = 0, scheduled = 0, blockcse = 0, hoisted = 0,
+         postra = 0;
   if (opts.machineOpt) {
+    sr = opt_.strengthReduction(fns);
     peephole = opt_.peephole(fns);
     scheduled = opt_.schedule(fns);
+    blockcse = opt_.blockLocalCse(fns);
+    hoisted = opt_.licm(fns);
   }
 
   // ---- 3) register allocation (graph-colouring + spills) ---------------
@@ -33,9 +37,14 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
   if (opts.machineOpt) postra = opt_.removeRedundantMoves(fns);
 
   if (opts.stats)
-    *opts.stats << "backend-peephole: " << peephole
+    *opts.stats << "backend-strength-reduction: " << sr
+                << " const div/rem/mul rewritten\n"
+                << "backend-peephole: " << peephole
                 << " instructions eliminated\n"
                 << "backend-schedule: " << scheduled << " loads hoisted\n"
+                << "backend-blockcse: " << blockcse
+                << " instructions eliminated\n"
+                << "backend-licm: " << hoisted << " instructions hoisted\n"
                 << "backend-postra-peephole: " << postra
                 << " moves removed\n";
 

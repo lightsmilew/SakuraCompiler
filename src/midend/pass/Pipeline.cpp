@@ -29,10 +29,14 @@ namespace {
 // the next one.
 void addCleanupRound(PassManager &pm, Layer l, bool aggressive) {
   pm.addPass(makeConstFoldPass(l));
+  // The comparison / add-chain canonicalisations reshape flat address and
+  // condition arithmetic; on the structured affine/scf layers they can fight
+  // the loop form, so keep them to the canonical cf form.
+  if (l == Layer::Cf) pm.addPass(makeNormalizeCmpPass(l));
   pm.addPass(makeAlgebraicPass(l));
   pm.addPass(makeConstFoldPass(l));
   pm.addPass(makeMemCsePass(l));
-  pm.addPass(makeAlgebraicPass(l));
+  if (l == Layer::Cf) pm.addPass(makeAddChainPass(l));
   pm.addPass(makeDeadCodePass(l));
   pm.addPass(makeConstFoldPass(l));
   if (aggressive) {
@@ -77,15 +81,34 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
     pm.addPass(makeCfgSimplifyPass());
     addCleanupRound(pm, Layer::Cf, aggr);
     // call-structure optimisation on the flat cf: inline small leaf helpers,
-    // then turn self tail calls into loops.
+    // turn self tail calls into loops, then inline the general non-recursive
+    // multi-block helpers (a recursion reduced to a flat loop above is now a
+    // plain inlineable body).  A cfg-simplify follows so dead clone blocks
+    // left by the splice are gone before mem2reg (which needs every non-entry
+    // block reachable).
     pm.addPass(makeInlineSmallPass());
     pm.addPass(makeTailRecElimPass());
+    pm.addPass(makeInlineGeneralPass());
+    pm.addPass(makeCfgSimplifyPass());
     addCleanupRound(pm, Layer::Cf, aggr);
     // SSA register promotion: lift non-escaping scalar slots out of memory so
     // loop counters and temporaries live in registers.  The cleanup round
     // after it drops the now-dead slot allocas/loads/stores and folds away
     // any trivial phis.
+    //
+    // mem2reg needs a fully reachable CFG (dominance-based).  Its entry guard
+    // bails out on any function that still carries an unreachable block
+    // (constant folding in the cleanup round above can leave dead arms), so
+    // those functions keep their memory form - correct, if less promoted.
     pm.addPass(makeMem2RegPass());
+    addCleanupRound(pm, Layer::Cf, aggr);
+    // mem2reg strips the promoted loads/stores, which leaves many blocks
+    // holding nothing but a jump; collapse those (and any identical-arm
+    // cond_br) now that the phis are in place, then run whole-CFG dominance
+    // CSE over the promoted phi/SSA values: folds the recomputations that
+    // straight-line mem-cse has to give up on at joins / loop headers.
+    pm.addPass(makeCfgSimplifyPass());
+    pm.addPass(makeDomCsePass(Layer::Cf));
     addCleanupRound(pm, Layer::Cf, aggr);
     pm.addPass(makeRemoveUnusedPass(Layer::Cf));
   }

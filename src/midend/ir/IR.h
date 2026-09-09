@@ -279,6 +279,8 @@ public:
   const std::vector<std::unique_ptr<GlobalVar>> &globals() const {
     return globals_;
   }
+  std::vector<std::unique_ptr<Value>> &arena() { return arena_; }
+  const std::vector<std::unique_ptr<Value>> &arena() const { return arena_; }
   std::vector<std::unique_ptr<Function>> &functions() { return functions_; }
   const std::vector<std::unique_ptr<Function>> &functions() const {
     return functions_;

@@ -311,6 +311,9 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   case MOp_::Li:
     os << "\tli " << xrn(m.dst) << ", " << m.imm << "\n";
     return;
+  case MOp_::LiWide:
+    os << "\tli " << xrn(m.dst) << ", " << m.cst << "\n";
+    return;
   case MOp_::LiF:
     os << "\tli t0, " << m.imm << "\n";
     os << "\tfmv.w.x " << frn(m.dst) << ", t0\n";
@@ -360,6 +363,33 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
     return;
   case MOp_::IRem:
     os << "\tremw " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
+  case MOp_::Mulh:
+    os << "\tmulh " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
+  case MOp_::SllI:
+    os << "\tslliw " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 31) << "\n";
+    return;
+  case MOp_::SrlI:
+    os << "\tsrliw " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 31) << "\n";
+    return;
+  case MOp_::SraI:
+    os << "\tsraiw " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 31) << "\n";
+    return;
+  case MOp_::Shl64I:
+    os << "\tslli " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 63) << "\n";
+    return;
+  case MOp_::Shr64I:
+    os << "\tsrli " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 63) << "\n";
+    return;
+  case MOp_::Sar64I:
+    os << "\tsrai " << xrn(m.dst) << ", " << xrn(m.a) << ", "
+       << (m.imm & 63) << "\n";
     return;
   case MOp_::IXor:
     os << "\txor " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";

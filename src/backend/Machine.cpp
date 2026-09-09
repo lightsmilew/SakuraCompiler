@@ -68,6 +68,7 @@ OpSlots slots(const MInst &m) {
   case MOp::LeaFrame:
   case MOp::LeaGlobal:
   case MOp::Li:
+  case MOp::LiWide:
     s.def = m.dst;
     s.defFile = RF_X;
     break;
@@ -96,6 +97,7 @@ OpSlots slots(const MInst &m) {
   case MOp::IMul:
   case MOp::IDiv:
   case MOp::IRem:
+  case MOp::Mulh:
   case MOp::IXor:
   case MOp::ISlt:
   case MOp::ISltu:
@@ -110,6 +112,12 @@ OpSlots slots(const MInst &m) {
   case MOp::ISlti:
   case MOp::ISltiu:
   case MOp::ISltuZ:
+  case MOp::SllI:
+  case MOp::SrlI:
+  case MOp::SraI:
+  case MOp::Shl64I:
+  case MOp::Shr64I:
+  case MOp::Sar64I:
     s.def = m.dst; s.defFile = RF_X;
     s.use[0] = m.a; s.useFile[0] = RF_X;
     break;

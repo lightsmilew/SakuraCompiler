@@ -66,6 +66,14 @@ public:
   int nextFrameByte = 0;
   int maxStk = 0;
   MBlock *cur = nullptr;
+  // Scalar/float constant materialisation cache, scoped to the *current*
+  // basic block only.  Reusing a vreg across blocks is unsafe: the `li`
+  // lands at the first use, which need not dominate sibling blocks (the same
+  // literal used on both arms of a cond_br after a helper was inlined into
+  // each arm).  Within one straight-line block reuse is safe and keeps
+  // register pressure low on argument-heavy functions.
+  const BasicBlock *curBB = nullptr;
+  std::unordered_map<const Value *, int32_t> blkConst;
 
   std::string labelFor(BasicBlock *bb) const {
     return ".L" + mf.name + "_" + bb->name;
@@ -86,20 +94,24 @@ public:
       if (pi->op == Op::Phi) return phiRegs.at(pi); // bound in the pre-scan
     MInst m;
     if (auto *ci = dynamic_cast<ConstantInt *>(v)) {
+      auto cIt = blkConst.find(v);
+      if (cIt != blkConst.end()) return cIt->second; // same-block reuse
       m.op = MOp::Li;
       m.dst = newReg();
       m.imm = ci->v;
       m.line = line;
       emit(m);
-      return vreg[v] = m.dst;
+      return blkConst[v] = m.dst; // cached only for the current block
     }
     if (auto *cf = dynamic_cast<ConstantFloat *>(v)) {
+      auto cIt = blkConst.find(v);
+      if (cIt != blkConst.end()) return cIt->second;
       m.op = MOp::LiF;
       m.dst = newReg();
       m.imm = (int32_t)cf->bits();
       m.line = line;
       emit(m);
-      return vreg[v] = m.dst;
+      return blkConst[v] = m.dst; // same-block reuse only
     }
     std::string desc = "?";
     if (auto *inst = dynamic_cast<Instruction *>(v))
@@ -882,6 +894,8 @@ std::vector<MachineFunc> InstructionSelector::select(Module *mod) {
       mb.name = L.labelFor(bb);
       L.mf.blocks.push_back(std::move(mb));
       L.cur = &L.mf.blocks.back();
+      L.curBB = bb;
+      L.blkConst.clear(); // constants are only reusable inside one block
       if (bi == 0) {
         MInst p;
         p.op = MOp::Prologue;

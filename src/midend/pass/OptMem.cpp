@@ -185,6 +185,17 @@ private:
                                 ? nullptr
                                 : onlyPred->instrs.back().get();
           if (!pt || pt->op != Op::Br) singlePred = false; // straight-line only
+          // State is a single forward map threaded through *layout order*.
+          // It therefore holds the end-state of the previous block in the
+          // list, which is the predecessor's end-state only when the
+          // predecessor is laid out immediately before this block.  Any block
+          // in between (e.g. an unreachable leftover sitting between the
+          // entry and a branch target, whose pred-count is 0 yet which still
+          // repopulates the map as it is walked) would otherwise leak its own
+          // slot contents into `bb`.  Requiring adjacency keeps the inherited
+          // map exactly equal to the unique predecessor's end-state.
+          if (onlyPred && index[onlyPred] + 1 != index[bb.get()])
+            singlePred = false;
         }
       }
       if (!singlePred || loopExit.count(bb.get())) {

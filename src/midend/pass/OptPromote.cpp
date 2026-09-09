@@ -571,12 +571,32 @@ private:
     // redirect every load to its reaching definition, collapse trivial phis,
     // then erase the promoted slots (allocas + loads + stores).
     //
-    // Order matters: folding a phi can rewrite *other* phis' incoming values
-    // to a load that is about to be erased, so the load->def rewrite must run
-    // again after foldPhis.  Only then is it safe to drop the slots.
-    for (auto &kv : rep) replaceAllUses(mod, kv.first, kv.second);
+    // rep can contain chains: the reaching definition of one slot's load may
+    // itself be a load of another promoted slot (a store that forwards one
+    // slot into another).  Rewriting each entry in map order would leave uses
+    // pointing at an erased intermediate when the consumer entry is visited
+    // before its def entry, so chase every target to the end of its chain
+    // first.  foldPhis below can re-introduce a rep load (a folded phi whose
+    // unique incoming value is a promoted load), so the rewrite runs once
+    // more after folding, chasing again each time.
+    auto applyRep = [&](Module &m,
+                        const std::unordered_map<Instruction *, Value *> &r) {
+      for (auto &kv : r) {
+        Value *to = kv.second;
+        std::unordered_set<Instruction *> seen;
+        while (true) {
+          auto *toI = dynamic_cast<Instruction *>(to);
+          auto it = (toI && !seen.count(toI)) ? r.find(toI) : r.end();
+          if (it == r.end()) break;
+          seen.insert(toI);
+          to = it->second;
+        }
+        replaceAllUses(m, kv.first, to);
+      }
+    };
+    applyRep(mod, rep);
     foldPhis(mod, f, eraseSet);
-    for (auto &kv : rep) replaceAllUses(mod, kv.first, kv.second);
+    applyRep(mod, rep);
     for (auto &bb : f.blocks)
       for (auto it = bb->instrs.begin(); it != bb->instrs.end();)
         if (eraseSet.count(it->get())) it = bb->instrs.erase(it);
