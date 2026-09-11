@@ -24,7 +24,7 @@
 #
 # Environment:
 #   COMP        compiler binary          (default: <repo>/build/compiler)
-#   JOBS        parallel jobs            (default: nproc, capped at 16)
+#   JOBS        parallel jobs  (default: memory-aware, see scripts/memjobs.sh)
 #   KEEP_GOING  set to 1 to continue past a failing file (default: stop)
 #
 # Examples:
@@ -38,8 +38,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 COMP="${COMP:-$ROOT/build/compiler}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
-[ "$JOBS" -gt 16 ] && JOBS=16
+if [ -n "${JOBS:-}" ]; then
+  JOBS="$JOBS"
+else
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/memjobs.sh"
+  JOBS="$(memjobs)"
+fi
 KEEP_GOING="${KEEP_GOING:-0}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-180}"
 
@@ -71,7 +76,7 @@ while [ $i -lt $# ]; do
       ;;
     --)
       # everything after -- is a compiler flag (verbatim)
-      j=$((i+1))
+      j=$((i+2))
       while [ $j -le $# ]; do FLAGS+=("${*:$j:1}"); j=$((j+1)); done
       i=$#
       ;;

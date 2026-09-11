@@ -18,6 +18,8 @@
 // ---------------------------------------------------------------------------
 #include "Opt.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -36,6 +38,7 @@ public:
 
   bool run(Module &mod) override {
     bool any = false;
+    fx_.compute(mod);
     for (auto &f : mod.functions()) {
       if (f->isLib) continue;
       process(mod, f->blocks, &any);
@@ -45,6 +48,7 @@ public:
 
 private:
   Layer layer_;
+  Effects fx_;
 
   // -----------------------------------------------------------------------
   // key materialisation
@@ -84,12 +88,24 @@ private:
     return k;
   }
 
+  // Key for a call to a value-like function: the callee plus the argument
+  // values.  `exprKey` cannot be used because the callee is a structural
+  // operand and would make the key empty.
+  static std::string callKey(Instruction *call) {
+    char b[32];
+    snprintf(b, sizeof b, "C:%p:", (void *)call->ops[0]);
+    std::string k = b;
+    for (size_t i = 1; i < call->ops.size(); ++i)
+      k += valueKey(call->ops[i]) + ";";
+    return k;
+  }
+
   bool isPureExprOp(Op op) const {
     switch (op) {
     case Op::Add: case Op::Sub: case Op::Mul: case Op::SDiv: case Op::SRem:
     case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
     case Op::ICmp: case Op::FCmp: case Op::Sitofp: case Op::Fptosi:
-    case Op::Not: case Op::Gep:
+    case Op::Not: case Op::Gep: case Op::Select:
       return true;
     default:
       return false;
@@ -258,7 +274,32 @@ private:
           ++i;
         }
       } else if (op == Op::Call) {
-        mem.clear(); // a call may write any global / param / escaped slot
+        auto *callee = (!inst->ops.empty())
+                           ? dynamic_cast<Function *>(inst->ops[0])
+                           : nullptr;
+        // A call to a function that cannot write memory leaves every cached
+        // load valid, so the forwarding table survives it.  Without the
+        // inferred "writes nothing" attribute (LLVM's readonly) this is a
+        // full barrier and every tracked slot is dropped.
+        const bool noWrite = callee && fx_.callWritesNothing(callee);
+        if (!noWrite) mem.clear();
+        // Two calls of a function whose result depends only on its arguments
+        // are the same value, so the second is redundant -- this is what
+        // collapses fft's `x + multiply(wn, y)` / `x - multiply(wn, y)` pair
+        // into one call, as clang does.
+        static const bool noCallCse = std::getenv("SAKU_NO_CALLCSE") != nullptr;
+        if (!noCallCse && noWrite && inst->ty != Type::Void &&
+            fx_.callIsValue(callee)) {
+          std::string k = callKey(inst);
+          auto it = exprs.find(k);
+          if (it != exprs.end() && it->second != (Value *)inst) {
+            replaceAllUses(mod, inst, it->second);
+            instrs.erase(instrs.begin() + i);
+            *any = true;
+            continue;
+          }
+          exprs[k] = inst;
+        }
         ++i;
       } else if (isPureExprOp(op)) {
         std::string k = exprKey(op, inst->cond, inst->ops);
@@ -295,27 +336,49 @@ private:
     return b;
   }
 
+  // Key prefix identifying every tracked location rooted at one object.
+  static std::string rootPrefix(const void *root) {
+    char b[48];
+    snprintf(b, sizeof b, "o%p@", root);
+    return b;
+  }
+
   // Invalidate the entries a store at `addr` may clobber.
+  //
+  // When the address is rooted at a known object - even with a *dynamic*
+  // offset, as in `nextvalue[cnt]` - the only tracked locations it can reach
+  // are that same object and the dynamic (param/unknown-rooted) ones: two
+  // distinct allocas/globals are disjoint objects, and indexing off the end of
+  // one into another is undefined (the same assumption maySameLocation and
+  // LLVM's BasicAA make).  Global scalars therefore stay in the table across a
+  // store to a global array - which is what lets `cnt`, `pos`, `bits` and
+  // `buf` be read once per iteration of a hash-table or bit-stream loop
+  // instead of once per array store.
   static void storeKill(Value *addr,
                         std::unordered_map<std::string, Value *> &mem) {
     AddrInfo info = addressOf(addr);
-    if ((info.kind == RootKind::Alloca || info.kind == RootKind::Global) &&
-        info.constOff) {
-      // exact object + offset: only that location is overwritten
-      char b[64];
-      snprintf(b, sizeof b, "o%p@%lld", (void *)info.root,
-               (long long)info.off);
-      mem.erase(b);
-      if (info.kind == RootKind::Global) {
-        // a store to a global can be observed through an aliasing param
-        for (auto it = mem.begin(); it != mem.end();) {
-          if (it->first[0] == 'd') it = mem.erase(it);
-          else ++it;
-        }
+    if (info.kind == RootKind::Alloca || info.kind == RootKind::Global) {
+      if (info.constOff) {
+        // exact object + offset: only that one location is overwritten
+        char b[64];
+        snprintf(b, sizeof b, "o%p@%lld", (void *)info.root,
+                 (long long)info.off);
+        mem.erase(b);
+      }
+      // Everything else rooted at the same object is unknown-offset and must
+      // go too; the dynamic entries may point into it as well.
+      std::string pfx = rootPrefix(info.root);
+      for (auto it = mem.begin(); it != mem.end();) {
+        bool sameRoot = it->first.compare(0, pfx.size(), pfx) == 0;
+        bool dynamic = !it->first.empty() && it->first[0] == 'd';
+        if (sameRoot || dynamic)
+          it = mem.erase(it);
+        else
+          ++it;
       }
       return;
     }
-    // dynamic / param-rooted address: may alias anything non-private
+    // param-rooted / unknown address: may alias anything non-private
     mem.clear();
   }
 
@@ -333,6 +396,163 @@ private:
 
 std::unique_ptr<Pass> makeMemCsePass(Layer l) {
   return std::make_unique<MemCsePass>(l);
+}
+
+// ===========================================================================
+// redundant-store: block-local dead stores + store-back of identical loads
+// ===========================================================================
+namespace {
+
+class RedundantStorePass final : public Pass {
+public:
+  explicit RedundantStorePass(Layer l) : layer_(l) {}
+  const char *name() const override { return "redundant-store"; }
+  Layer inLayer() const override { return layer_; }
+
+  bool run(Module &mod) override {
+    bool any = false;
+    for (auto &f : mod.functions()) {
+      if (f->isLib) continue;
+      std::function<void(BlockList &)> rec = [&](BlockList &list) {
+        for (auto &bb : list) {
+          any |= cleanBlock(*bb);
+          for (auto &iu : bb->instrs) {
+            Instruction *in = iu.get();
+            if (in->op == Op::AffineFor)
+              rec(in->bodyRegion);
+            else if (in->op == Op::ScfWhile) {
+              rec(in->condRegion);
+              rec(in->bodyRegion);
+            }
+          }
+        }
+      };
+      rec(f->blocks);
+    }
+    return any;
+  }
+
+private:
+  Layer layer_;
+
+  static std::string exactKey(Value *addr) {
+    AddrInfo info = addressOf(addr);
+    if ((info.kind == RootKind::Alloca || info.kind == RootKind::Global) &&
+        info.constOff) {
+      char b[64];
+      snprintf(b, sizeof b, "o%p@%lld", (void *)info.root,
+               (long long)info.off);
+      return b;
+    }
+    char b[32];
+    snprintf(b, sizeof b, "d%p", (void *)addr);
+    return b;
+  }
+
+  // Conservative "may these two addresses denote the same memory location?"
+  // Used when a load is seen: any pending store that may alias the load's
+  // address must be kept alive (dropped from the pending set) because the
+  // load could read the value that store wrote.  Returning false here lets
+  // the pass delete a store, so false is only allowed when the two objects
+  // are provably disjoint (distinct private allocas/globals, or exact,
+  // different constant offsets into the same object).  Everything doubtful
+  // returns true.
+  static bool maySameLocation(Value *a, Value *b) {
+    AddrInfo A = addressOf(a), B = addressOf(b);
+    if (!A.root || !B.root) return true; // unresolved / unknown root
+    if (A.root == B.root) {
+      if (A.constOff && B.constOff) return A.off == B.off;
+      return true; // same object, offset not statically exact
+    }
+    // Different root objects.  Two distinct allocas, an alloca vs anything
+    // else, and two distinct globals are all disjoint objects; anything that
+    // touches a param/unknown root may alias a global (params receive arrays
+    // from callers whose addresses are not tracked here).
+    if (A.kind == RootKind::Alloca || B.kind == RootKind::Alloca) return false;
+    bool aObj = A.kind == RootKind::Global;
+    bool bObj = B.kind == RootKind::Global;
+    if (aObj && bObj) return false; // two distinct global objects
+    return true;
+  }
+
+  bool cleanBlock(BasicBlock &bb) {
+    bool any = false;
+    auto &instrs = bb.instrs;
+
+    for (size_t i = 0; i < instrs.size();) {
+      Instruction *in = instrs[i].get();
+      if (in->op == Op::Store && in->ops.size() == 2) {
+        auto *ld = dynamic_cast<Instruction *>(in->ops[0]);
+        if (ld && ld->op == Op::Load && ld->ops.size() == 1 &&
+            ld->ops[0] == in->ops[1]) {
+          instrs.erase(instrs.begin() + (long)i);
+          any = true;
+          continue;
+        }
+      }
+      ++i;
+    }
+
+    std::unordered_map<std::string, size_t> lastStore;
+    // A pending store can only be marked dead by a later store to the *same
+    // location*; any intervening load (or call / region op) that may observe
+    // it must keep it alive.  The SSA pointer values %p and %q below are
+    // distinct values for the same address (e.g. two separate geps for
+    // res[i][j]); keying loads by pointer identity would therefore miss that
+    // a load of %q reads what a pending store to %p wrote, and the store
+    // would be wrongly eliminated.  Track the store's address operand (not
+    // only a pointer-identity key) so each load can invalidate every pending
+    // store whose address may alias it.  `lastStore` is the O(1) index of a
+    // pending entry by key; both containers are updated together.
+    std::vector<std::pair<Value *, size_t>> pending;
+    std::vector<char> dead(instrs.size(), 0);
+    for (size_t i = 0; i < instrs.size(); ++i) {
+      Instruction *in = instrs[i].get();
+      if (in->op == Op::Store && in->ops.size() == 2) {
+        Value *addr = in->ops[1];
+        std::string k = exactKey(addr);
+        auto it = lastStore.find(k);
+        if (it != lastStore.end()) dead[it->second] = 1;
+        lastStore[k] = i;
+        // drop the superseded pending entry (same key) and record the new
+        // store; entries a load already invalidated are no longer in either
+        // container
+        for (auto p = pending.begin(); p != pending.end();)
+          if (exactKey(p->first) == k) p = pending.erase(p);
+          else ++p;
+        pending.push_back({addr, i});
+      } else if (in->op == Op::Load && in->ops.size() == 1) {
+        // A load may read any pending store whose location overlaps this
+        // address: drop those so a later store cannot mark them dead.
+        Value *ld = in->ops[0];
+        for (auto p = pending.begin(); p != pending.end();)
+          if (maySameLocation(ld, p->first)) {
+            std::string pk = exactKey(p->first);
+            auto mit = lastStore.find(pk);
+            if (mit != lastStore.end() && mit->second == p->second)
+              lastStore.erase(mit);
+            p = pending.erase(p);
+          } else ++p;
+      } else if (in->op == Op::Call || in->op == Op::AffineFor ||
+                 in->op == Op::ScfWhile) {
+        lastStore.clear();
+        pending.clear();
+      }
+    }
+    for (size_t i = instrs.size(); i-- > 0;) {
+      if (dead[i]) {
+        instrs.erase(instrs.begin() + (long)i);
+        any = true;
+      }
+    }
+    return any;
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> makeRedundantStorePass(Layer l) {
+  return std::make_unique<RedundantStorePass>(l);
 }
 
 } // namespace ir

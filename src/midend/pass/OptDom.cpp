@@ -24,6 +24,7 @@
 #include "Opt.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +44,7 @@ public:
 
   bool run(Module &mod) override {
     bool any = false;
+    fx_.compute(mod);
     for (auto &f : mod.functions()) {
       if (f->isLib || f->blocks.size() < 2) continue;
       any |= processFunction(mod, *f);
@@ -52,6 +54,19 @@ public:
 
 private:
   Layer layer_;
+  Effects fx_;
+  bool noCallCse_ = false;
+
+  // Key for a value-like call: the callee plus the argument values.  Prefixed
+  // so it can never collide with an `exprKey` (which starts with the opcode).
+  static std::string callKey(Instruction *call) {
+    char b[32];
+    snprintf(b, sizeof b, "C:%p:", (void *)call->ops[0]);
+    std::string k = b;
+    for (size_t i = 1; i < call->ops.size(); ++i)
+      k += valueKey(call->ops[i]) + ";";
+    return k;
+  }
 
   // Pure, CSE-able expression opcodes (mirrors mem-cse's expression set;
   // alloca allocates fresh storage and load may change between executions, so
@@ -61,7 +76,7 @@ private:
     case Op::Add: case Op::Sub: case Op::Mul: case Op::SDiv: case Op::SRem:
     case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
     case Op::ICmp: case Op::FCmp: case Op::Sitofp: case Op::Fptosi:
-    case Op::Not: case Op::Gep:
+    case Op::Not: case Op::Gep: case Op::Select:
       return true;
     default:
       return false;
@@ -106,6 +121,7 @@ private:
   }
 
   bool processFunction(Module &mod, Function &f) {
+    noCallCse_ = std::getenv("SAKU_NO_CALLCSE") != nullptr;
     const size_t n = f.blocks.size();
     std::unordered_map<BasicBlock *, size_t> idx;
     for (size_t i = 0; i < n; ++i) idx[f.blocks[i].get()] = i;
@@ -193,28 +209,59 @@ private:
     // blocks in RPO, so the inherited map is final).  A def recorded while
     // walking a block overwrites any deeper entry for the same key, so the
     // map handed to dominated children holds the *closest* dominating def.
+    //
+    // availBlk tracks the block that owns each entry.  Folding a use onto a
+    // dominating def is only valid here when the def is *also* earlier in
+    // layout order: the back-end binds virtual registers by walking the block
+    // list, so a def that dominates a use but sits later in the list (which
+    // loop rotation can produce - the rotation guard keeps a branch to the
+    // loop exit, so the exit's dominators are no longer all before it) would
+    // have no register bound yet when the use is lowered.
     bool any = false;
     std::vector<std::unordered_map<std::string, Value *>> avail(n);
+    std::vector<std::unordered_map<std::string, size_t>> availBlk(n);
     for (size_t bi : rpo) {
-      if (bi != 0 && idom[bi] < n) avail[bi] = avail[idom[bi]];
+      if (bi != 0 && idom[bi] < n) {
+        avail[bi] = avail[idom[bi]];
+        availBlk[bi] = availBlk[idom[bi]];
+      }
       BasicBlock &bb = *f.blocks[bi];
       auto &instrs = bb.instrs;
       size_t i = 0;
       while (i < instrs.size()) {
         Instruction *inst = instrs[i].get();
         if (isTerminator(inst->op)) break;
+        // A call to a function that is a pure function of its arguments is as
+        // CSE-able as an `add`: equal arguments cannot give a different
+        // result, because everything it reads is immutable module data.  This
+        // catches helpers called with the same arguments from sibling blocks,
+        // which mem-cse's straight-line table cannot see.  Dominance is enough
+        // of a guard here because the globals a value-like callee reads are
+        // never written by any function in the module.
+        std::string k;
+        bool cseable = false;
         if (isCseOp(inst->op)) {
-          std::string k = exprKey(inst->op, inst->cond, inst->ops);
-          if (!k.empty()) {
-            auto it = avail[bi].find(k);
-            if (it != avail[bi].end() && it->second != (Value *)inst) {
-              replaceAllUses(mod, inst, it->second);
-              instrs.erase(instrs.begin() + i);
-              any = true;
-              continue; // do not advance: next instruction shifted in
+          k = exprKey(inst->op, inst->cond, inst->ops);
+          cseable = !k.empty();
+        } else if (inst->op == Op::Call && inst->ty != Type::Void &&
+                   !inst->ops.empty() && !noCallCse_) {
+          if (auto *callee = dynamic_cast<Function *>(inst->ops[0]))
+            if (fx_.callIsValue(callee)) {
+              k = callKey(inst);
+              cseable = true;
             }
-            avail[bi][k] = inst;
+        }
+        if (cseable) {
+          auto it = avail[bi].find(k);
+          if (it != avail[bi].end() && it->second != (Value *)inst &&
+              availBlk[bi][k] <= bi) {
+            replaceAllUses(mod, inst, it->second);
+            instrs.erase(instrs.begin() + i);
+            any = true;
+            continue; // do not advance: next instruction shifted in
           }
+          avail[bi][k] = inst;
+          availBlk[bi][k] = bi;
         }
         ++i;
       }

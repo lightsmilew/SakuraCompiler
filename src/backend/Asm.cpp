@@ -229,7 +229,7 @@ void emitCallShuffle(std::ostringstream &os, const MachineFunc &mf,
   if (items.empty()) return;
   // Phase 1: save sources that would be clobbered.
   for (auto &it : items) {
-    if (it.slot < 0) continue;
+    if (it.slot < 0 || it.src == it.tgt) continue; // self-copy needs no spill
     int64_t off = fr.outMax + (int64_t)it.slot * 8;
     if (it.isF)
       emitMem(os, "fsw", frn(it.src), off, "sp");
@@ -303,10 +303,15 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
     os << "\tla " << xrn(m.dst) << ", " << m.sym << "\n";
     return;
   case MOp_::MoveX:
-    os << "\tmv " << xrn(m.dst) << ", " << xrn(m.a) << "\n";
+    // The register allocator can coalesce a copy onto one register, and the
+    // argument shuffle regularly produces `mv a0, a0`; a self-move is dead
+    // weight on every call, so don't print it.
+    if (m.dst != m.a)
+      os << "\tmv " << xrn(m.dst) << ", " << xrn(m.a) << "\n";
     return;
   case MOp_::MoveF:
-    os << "\tfmv.s " << frn(m.dst) << ", " << frn(m.a) << "\n";
+    if (m.dst != m.a) // see MoveX
+      os << "\tfmv.s " << frn(m.dst) << ", " << frn(m.a) << "\n";
     return;
   case MOp_::Li:
     os << "\tli " << xrn(m.dst) << ", " << m.imm << "\n";
@@ -321,10 +326,14 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
 
   // ---- parameter reads
   case MOp_::EntryInt:
-    os << "\tmv " << xrn(m.dst) << ", " << xregName(m.imm) << "\n";
+    // When the allocator picked the incoming ABI register itself for the
+    // parameter, the read is already the value: no `mv a0, a0`.
+    if (m.dst != m.imm)
+      os << "\tmv " << xrn(m.dst) << ", " << xregName(m.imm) << "\n";
     return;
   case MOp_::EntryFlt:
-    os << "\tfmv.s " << frn(m.dst) << ", " << fregName(m.imm) << "\n";
+    if (m.dst != m.imm) // see EntryInt
+      os << "\tfmv.s " << frn(m.dst) << ", " << fregName(m.imm) << "\n";
     return;
   case MOp_::EntryStkInt:
     emitMem(os, (m.ty == Type::Ptr) ? "ld" : "lw", xrn(m.dst),
@@ -367,6 +376,12 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   case MOp_::Mulh:
     os << "\tmulh " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
     return;
+  case MOp_::Mulhu:
+    os << "\tmulhu " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
+  case MOp_::Mul64:
+    os << "\tmul " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
   case MOp_::SllI:
     os << "\tslliw " << xrn(m.dst) << ", " << xrn(m.a) << ", "
        << (m.imm & 31) << "\n";
@@ -397,6 +412,15 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   case MOp_::IXorI:
     os << "\txori " << xrn(m.dst) << ", " << xrn(m.a) << ", " << m.imm << "\n";
     return;
+  case MOp_::IAnd:
+    os << "\tand " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
+  case MOp_::IAndI:
+    os << "\tandi " << xrn(m.dst) << ", " << xrn(m.a) << ", " << m.imm << "\n";
+    return;
+  case MOp_::IOr:
+    os << "\tor " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
+    return;
 
   case MOp_::ISlt:
     os << "\tslt " << xrn(m.dst) << ", " << xrn(m.a) << ", " << xrn(m.b) << "\n";
@@ -416,12 +440,24 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
 
   case MOp_::ICmp: {
     std::string a = xrn(m.a), b = xrn(m.b);
+    // `x == 0` / `x != 0` are a single `seqz` / `snez`: the generic form's
+    // leading `xor dst, a, x0` is a no-op, and this shape is everywhere (every
+    // `while (x)`, every `if (p != 0)` in a linked-list walk).
+    const bool bIsZero = m.b == -1 || m.b == 0;
     switch ((Cond)m.imm) {
     case Cond::Eq:
+      if (bIsZero) {
+        os << "\tseqz " << xrn(m.dst) << ", " << a << "\n";
+        break;
+      }
       os << "\txor " << xrn(m.dst) << ", " << a << ", " << b << "\n";
       os << "\tseqz " << xrn(m.dst) << ", " << xrn(m.dst) << "\n";
       break;
     case Cond::Ne:
+      if (bIsZero) {
+        os << "\tsnez " << xrn(m.dst) << ", " << a << "\n";
+        break;
+      }
       os << "\txor " << xrn(m.dst) << ", " << a << ", " << b << "\n";
       os << "\tsnez " << xrn(m.dst) << ", " << xrn(m.dst) << "\n";
       break;
@@ -526,6 +562,13 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
     return;
   case MOp_::SwF:
     emitMem(os, "sw", xrn(m.a), fr.localBase + m.imm, "sp");
+    return;
+  case MOp_::SdF:
+    // `a` is always x0 (`xrn(-1)` == "zero"); see Machine.h.  Alignment is
+    // guaranteed by the producer: localBase is a multiple of 8 (outMax is
+    // align8'd and shuffle/spill bytes are multiples of 8) and the producer
+    // only fuses a pair starting at an offset that is itself a multiple of 8.
+    emitMem(os, "sd", xrn(m.a), fr.localBase + m.imm, "sp");
     return;
   case MOp_::FswF:
     emitMem(os, "fsw", frn(m.a), fr.localBase + m.imm, "sp");

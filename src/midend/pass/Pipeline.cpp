@@ -9,6 +9,7 @@
 // conversion passes and Opt.h for the optimisation passes.
 #include "Pipeline.h"
 
+#include <cstdlib>
 #include <memory>
 #include <ostream>
 
@@ -33,10 +34,16 @@ void addCleanupRound(PassManager &pm, Layer l, bool aggressive) {
   // condition arithmetic; on the structured affine/scf layers they can fight
   // the loop form, so keep them to the canonical cf form.
   if (l == Layer::Cf) pm.addPass(makeNormalizeCmpPass(l));
+  // Reassociate add/sub trees into a canonical linear combination (LLVM's
+  // Reassociate): the inlined index / mask helpers expand into long chains of
+  // `a - b + b - c` that only this rewrite collapses.  The algebraic pass that
+  // follows clears up the `x + 0` shims it leaves behind.
+  if (l == Layer::Cf && !getenv("SAKU_NO_REASSOC")) pm.addPass(makeReassocPass(l));
   pm.addPass(makeAlgebraicPass(l));
   pm.addPass(makeConstFoldPass(l));
   pm.addPass(makeMemCsePass(l));
   if (l == Layer::Cf) pm.addPass(makeAddChainPass(l));
+  pm.addPass(makeRedundantStorePass(l));
   pm.addPass(makeDeadCodePass(l));
   pm.addPass(makeConstFoldPass(l));
   if (aggressive) {
@@ -54,6 +61,9 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
   pm.addPass(makeExpandTensorOpsPass());
   if (level != OptLevel::O0) {
     addCleanupRound(pm, Layer::Affine, aggr);
+    // Matmul ijk->ikj before LICM/unroll so the rewritten nests benefit from
+    // both (LLVM LoopInterchange-style locality for array/matrix kernels).
+    if (aggr) pm.addPass(makeMatmulIkjPass(Layer::Affine));
     pm.addPass(makeLicmPass(Layer::Affine));
     pm.addPass(makeLoopUnrollPass(Layer::Affine));
     addCleanupRound(pm, Layer::Affine, aggr);
@@ -102,6 +112,42 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
     // those functions keep their memory form - correct, if less promoted.
     pm.addPass(makeMem2RegPass());
     addCleanupRound(pm, Layer::Cf, aggr);
+    // Branchless if-conversion (LLVM's SimplifyCFG two-entry-PHI select).
+    // The bit-at-a-time kernels are a dense chain of one-instruction `if`s;
+    // after promotion each is a two-entry diamond whose phi the back-end would
+    // lower to a branch plus register copies.  Turning it into `select` and
+    // merging the diamond collapses the chain into a handful of ALU ops.  It
+    // has to run after mem2reg (the phis are what it recognises) and before
+    // ind-var / rotation (it removes the branches they would otherwise have to
+    // work around); cfg-simplify afterwards merges the remains so the next
+    // `if` becomes visible to the pass's own fixpoint loop.
+    if (!getenv("SAKU_NO_IFCONV")) {
+      pm.addPass(makeIfConvPass());
+      pm.addPass(makeCfgSimplifyPass());
+      addCleanupRound(pm, Layer::Cf, aggr);
+    }
+    // Flat-CFG LICM.  It has to run after the inliner (so a callee's array
+    // parameters have been replaced by the caller's actual objects, which is
+    // what makes the alias test decide `no-alias` for `C[i][j] = C[i][j] *
+    // A[i][k] + B[k][j]`) and after mem2reg (so the loop-carried scalars are
+    // already SSA and the addresses are plain gep chains).  It runs *before*
+    // ind-var so the addresses are still `root + offset` and `addressOf` can
+    // classify them.
+    if (!getenv("SAKU_NO_CFLICM")) pm.addPass(makeCfLicmPass());
+    addCleanupRound(pm, Layer::Cf, aggr);
+    // Induction-variable strength reduction: rewrite `gep base, iv*K + C` into
+    // a loop-carried pointer, so the inner loop bumps an address instead of
+    // recomputing one (and the multiply leaves the critical path).  It needs
+    // the promoted phi form, hence after mem2reg; the cleanup round that
+    // follows removes the now-dead offset arithmetic.
+    if (!getenv("SAKU_NO_INDVAR")) pm.addPass(makeIndVarPass(Layer::Cf));
+    addCleanupRound(pm, Layer::Cf, aggr);
+    // Loop rotation: move the loop test from the header to the latch so the
+    // unconditional back-edge jump becomes the conditional one (one branch
+    // per iteration instead of two).  Runs after ind-var so the pointer phis
+    // are already in the header and rotate along with the others; cfg-simplify
+    // afterwards folds a guard whose condition is statically known.
+    if (!getenv("SAKU_NO_ROTATE")) pm.addPass(makeLoopRotatePass(Layer::Cf));
     // mem2reg strips the promoted loads/stores, which leaves many blocks
     // holding nothing but a jump; collapse those (and any identical-arm
     // cond_br) now that the phis are in place, then run whole-CFG dominance

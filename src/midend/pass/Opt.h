@@ -26,6 +26,7 @@
 //                     tree (folds what mem-cse's join-reset cannot see)
 //   licm            - hoist loop-invariant pure ops / loads out of loops
 //   loop-unroll     - fully unroll affine.for with a small constant trip count
+//   matmul-ikj      - rewrite ijk matmul nests to cache-friendly ikj order
 //   cfg-simplify    - flat-cf cleanup: const cond_br, empty/merge/unreachable
 //   tail-rec-elim   - self tail calls -> loops (simple form)
 //   inline-general  - inline non-recursive functions with more than one block
@@ -51,14 +52,20 @@ std::unique_ptr<Pass> makeDeadCodePass(Layer l);
 std::unique_ptr<Pass> makeRemoveUnusedPass(Layer l);
 std::unique_ptr<Pass> makeMemCsePass(Layer l);
 std::unique_ptr<Pass> makeDomCsePass(Layer l);
+std::unique_ptr<Pass> makeIndVarPass(Layer l);
+std::unique_ptr<Pass> makeCfLicmPass();
+std::unique_ptr<Pass> makeIfConvPass();
+std::unique_ptr<Pass> makeLoopRotatePass(Layer l);
 std::unique_ptr<Pass> makeLicmPass(Layer l);
 std::unique_ptr<Pass> makeLoopUnrollPass(Layer l);
+std::unique_ptr<Pass> makeMatmulIkjPass(Layer l);
 std::unique_ptr<Pass> makeCfgSimplifyPass();
 std::unique_ptr<Pass> makeTailRecElimPass();
 std::unique_ptr<Pass> makeInlineSmallPass();
 std::unique_ptr<Pass> makeMem2RegPass();
 
 std::unique_ptr<Pass> makeNormalizeCmpPass(Layer l);
+std::unique_ptr<Pass> makeReassocPass(Layer l);
 std::unique_ptr<Pass> makeAddChainPass(Layer l);
 std::unique_ptr<Pass> makeRedundantStorePass(Layer l);
 std::unique_ptr<Pass> makeInlineGeneralPass();

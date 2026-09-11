@@ -324,29 +324,69 @@ private:
     return slots;
   }
 
-  // A slot may only be promoted when no load can observe an unwritten slot:
-  // every load must sit strictly below a store, or textually after one in its
-  // own block.  Anything else keeps its memory semantics (left untouched).
+  // A slot may only be promoted when no load can observe an unwritten slot.
+  //
+  // The condition is a *must*-initialization dataflow, not "some store
+  // dominates the load".  The difference matters for the single most common
+  // shape in the suite: an if/else that assigns a local on both arms and then
+  // reads it after the join.
+  //
+  //      bb0 -> bb1 (store) -> bb3
+  //          -> bb2 (store) -> bb3        load in bb3
+  //
+  // Neither store dominates bb3, yet every path into bb3 carries one, so the
+  // load is well defined and the slot is fully promotable.  Requiring one
+  // dominating store rejected this outright, which is why if/else-merged
+  // locals stayed in memory (and dragged a spill / reload through the hot
+  // loop in the bit-twiddling kernels).  The old test also had to reject the
+  // genuinely dangerous case `int r; if (x) r = 1; use(r);`, where the else
+  // path reaches the load with no definition: that one is still rejected,
+  // because the diamond's join is reachable from the branch's other arm.
+  //
+  // Forward, may-be-uninitialized dataflow over blocks.  A store inside a
+  // block clears the state; a load does not change it (only observed).  The
+  // entry block starts uninitialized; a block starts uninitialized when any
+  // predecessor leaves it uninitialized, which also catches loop back-edges.
   bool allLoadsInitialized(const Slot &s, const Cfg &cfg) const {
-    for (const Ev &load : s.events) {
-      if (load.isStore) continue;
-      BasicBlock *lb = findBlock(load.inst);
-      int L = lb ? cfg.idx.at(lb) : -1;
-      if (L < 0) return false;
-      bool ok = false;
-      for (const Ev &st : s.events) {
-        if (!st.isStore) continue;
-        BasicBlock *db = findBlock(st.inst);
-        int D = db ? cfg.idx.at(db) : -1;
-        if (D < 0) continue;
-        if (D == L) {
-          if (st.pos < load.pos) { ok = true; break; }
-        } else if (cfg.dominates(D, L)) {
-          ok = true;
-          break;
+    const int n = cfg.n;
+    std::vector<std::vector<const Ev *>> be((size_t)n);
+    for (const Ev &e : s.events) {
+      BasicBlock *b = findBlock(e.inst);
+      if (!b) return false;
+      be[cfg.idx.at(b)].push_back(&e);
+    }
+    for (int b = 0; b < n; ++b)
+      std::sort(be[(size_t)b].begin(), be[(size_t)b].end(),
+                [](const Ev *x, const Ev *y) { return x->pos < y->pos; });
+
+    // in[b]     : may the slot be uninitialized on entry to b
+    // exitU[b]  : ... on exit from b (a store on the way clears it)
+    std::vector<char> in((size_t)n, 0), exitU((size_t)n, 0);
+    in[0] = 1;
+    for (int round = 0; round <= n; ++round) {
+      bool changed = false;
+      for (int b = 0; b < n; ++b) {
+        if (b != 0) {
+          char v = 0;
+          for (int p : cfg.preds[(size_t)b])
+            if (exitU[(size_t)p]) { v = 1; break; }
+          if (v != in[(size_t)b]) { in[(size_t)b] = v; changed = true; }
         }
+        char cur = in[(size_t)b];
+        for (const Ev *e : be[(size_t)b])
+          if (e->isStore) cur = 0;
+        if (cur != exitU[(size_t)b]) { exitU[(size_t)b] = cur; changed = true; }
       }
-      if (!ok) return false;
+      if (!changed) break;
+    }
+
+    // Every load must sit on a path that has already stored.
+    for (int b = 0; b < n; ++b) {
+      char cur = in[(size_t)b];
+      for (const Ev *e : be[(size_t)b]) {
+        if (e->isStore) cur = 0;
+        else if (cur) return false;
+      }
     }
     return true;
   }
@@ -558,8 +598,19 @@ private:
     std::unordered_map<Instruction *, Value *> rep;
     std::unordered_set<Instruction *> eraseSet;
     for (Slot &s : slots) {
-      if (s.escaped || s.alloca->n != 1) continue;
-      if (!allLoadsInitialized(s, cfg)) continue;
+      const bool dbg = std::getenv("SAKU_M2R_DEBUG") != nullptr;
+      if (s.escaped || s.alloca->n != 1) {
+        if (dbg)
+          fprintf(stderr, "m2r: skip slot %p escaped=%d n=%d\n",
+                  (void *)s.alloca, (int)s.escaped, s.alloca->n);
+        continue;
+      }
+      if (!allLoadsInitialized(s, cfg)) {
+        if (dbg)
+          fprintf(stderr, "m2r: skip slot %p: load-before-store\n",
+                  (void *)s.alloca);
+        continue;
+      }
       bool hasLoad = false, hasStore = false;
       for (const Ev &e : s.events)
         (e.isStore ? hasStore : hasLoad) = true;

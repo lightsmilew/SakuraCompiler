@@ -38,6 +38,18 @@ namespace {
 
 constexpr int kMaxCalleeInstrs = 64; // cloned instructions per call
 constexpr int kMaxCallerGrowth = 400; // total cloned instrs / caller, lifetime
+// A callee reached from at most this many call sites is almost always worth
+// inlining regardless of size: the clone removes the call overhead on a hot
+// path, and - more importantly for array kernels - it replaces a pointer
+// *parameter* with whatever the caller actually passed.  When the argument is
+// a distinct global array that turns a `may-alias` into a `no-alias`, which is
+// what lets the invariant loads inside the loop be hoisted.  LLVM's inliner
+// has the same effect through its LastCallToStaticBonus.  Measured on
+// 01_mm3: inlining `mm` into `main` is worth ~8x there, and the same shape
+// (small helper called a handful of times) recurs across the suite.
+constexpr int kRareCallSites = 2;
+constexpr int kMaxCalleeInstrsRare = 320;
+constexpr int kMaxCallerGrowthRare = 1400;
 
 class InlineGeneralPass final : public Pass {
 public:
@@ -46,6 +58,8 @@ public:
 
   bool run(Module &mod) override {
     computeCalleeClosure(mod);
+    countCallSites(mod);
+    bigInline_ = std::getenv("SAKU_NO_BIGINLINE") == nullptr;
     bool any = false;
     bool grow = true;
     while (grow) { // an inline can expose call sites worth another round
@@ -108,6 +122,24 @@ private:
     }
   }
 
+  // How many call sites (across the whole module) target each callee.  Used
+  // for the "rarely called => inline regardless of size" budget below.
+  std::unordered_map<Function *, int> callSites_;
+  bool bigInline_ = true;
+
+  void countCallSites(Module &mod) {
+    callSites_.clear();
+    for (auto &f : mod.functions()) {
+      if (f->isLib) continue;
+      for (auto &bb : f->blocks)
+        for (auto &iu : bb->instrs) {
+          if (iu->op != Op::Call) continue;
+          if (auto *t = dynamic_cast<Function *>(iu->ops[0]))
+            if (!t->isLib) ++callSites_[t];
+        }
+    }
+  }
+
   bool hasRegion(Function &f) const {
     for (auto &bb : f.blocks)
       for (auto &iu : bb->instrs)
@@ -150,7 +182,15 @@ private:
     // doInline), so a caller that already carries an inline-merge phi can be
     // inlined into again.
     if (hasRegion(*callee) || hasRegion(*caller)) return false;
-    if (calleeCost(callee) > kMaxCalleeInstrs) return false;
+    // A callee with only one or two call sites gets a much larger budget: the
+    // clone is not duplicated anywhere, so the size cost is paid once and the
+    // argument-specialisation win applies at every one of those sites.
+    auto csIt = callSites_.find(callee);
+    const int nSites = (csIt == callSites_.end()) ? 0 : csIt->second;
+    const bool rare = bigInline_ && nSites > 0 && nSites <= kRareCallSites;
+    const int calleeCap = rare ? kMaxCalleeInstrsRare : kMaxCalleeInstrs;
+    const int callerCap = rare ? kMaxCallerGrowthRare : kMaxCallerGrowth;
+    if (calleeCost(callee) > calleeCap) return false;
     if (call->ops.size() - 1 != callee->args.size()) return false;
     if (callee->ret != call->ty) return false; // incl. void matching
     // A non-void callee must return on some path; void callees must have a
@@ -163,7 +203,7 @@ private:
     // call-cycle guard + lifetime budget (see comments above)
     auto it = reach_.find(callee);
     if (it != reach_.end() && it->second.count(caller)) return false;
-    if (grownBy_[caller] + calleeCost(callee) > kMaxCallerGrowth) return false;
+    if (grownBy_[caller] + calleeCost(callee) > callerCap) return false;
     return true;
   }
 

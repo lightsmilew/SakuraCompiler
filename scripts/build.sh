@@ -7,7 +7,7 @@
 #
 # Environment:
 #   BUILD_DIR   build tree location            (default: <repo>/build)
-#   JOBS        parallel jobs                  (default: nproc)
+#   JOBS        parallel jobs  (default: memory-aware, see scripts/memjobs.sh)
 #
 # The only required toolchain is CMake >= 3.10 and a C++17 compiler; the
 # ANTLR4 runtime is vendored under 3rd_party/, so nothing is fetched from the
@@ -18,7 +18,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BUILD_DIR="${BUILD_DIR:-build}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+if [ -n "${JOBS:-}" ]; then
+  JOBS="$JOBS"
+else
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/memjobs.sh"
+  JOBS="$(memjobs)"
+fi
 
 case "${1:-}" in
   clean|-clean|--clean)

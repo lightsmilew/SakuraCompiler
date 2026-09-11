@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 #include "Opt.h"
 
+#include <cstdlib>
 #include <unordered_set>
 
 #include "OptUtil.h"
@@ -385,6 +386,28 @@ private:
       if (cb && cb->v == 0) return mod.constInt(0);     // x * 0
       if (ca && ca->v == 1 && !asConstInt(b)) return b; // 1 * x
       if (cb && cb->v == 1) return a;                   // x * 1
+      if (ca && ca->v == -1 && !asConstInt(b)) {
+        // -1 * x -> 0 - x (mutated in place)
+        inst->op = Op::Sub;
+        inst->ops = {mod.constInt(0), b};
+        return nullptr;
+      }
+      if (cb && cb->v == -1) {
+        inst->op = Op::Sub;
+        inst->ops = {mod.constInt(0), a};
+        return nullptr;
+      }
+      // x * 2 -> x + x (exposes add-chain / CSE without a shift opcode)
+      if (cb && cb->v == 2) {
+        inst->op = Op::Add;
+        inst->ops = {a, a};
+        return nullptr;
+      }
+      if (ca && ca->v == 2 && !asConstInt(b)) {
+        inst->op = Op::Add;
+        inst->ops = {b, b};
+        return nullptr;
+      }
       return nullptr;
     case Op::FAdd:
       if (fa && fa->v == 0.0f) return b;
@@ -417,6 +440,17 @@ private:
           inst->ops = u->ops; // reuse the compare's operands
           return nullptr;     // mutated in place; not a "replacement"
         }
+      return nullptr;
+    }
+    case Op::Select: {
+      // select c, a, b: a known condition folds to one arm, and equal arms
+      // fold regardless of `c`.  (`a` here is ops[0] == the condition, so the
+      // arms are read off the instruction directly.)
+      if (inst->ops.size() != 3) return nullptr;
+      Value *t = inst->ops[1], *f = inst->ops[2];
+      if (t == f) return t;
+      const ConstantInt *c = asConstInt(inst->ops[0]);
+      if (c) return c->v != 0 ? t : f;
       return nullptr;
     }
     case Op::Gep: {
@@ -464,6 +498,7 @@ public:
     // round 1: unused pure / load / gep instructions
     for (;;) {
       bool ch = dropDeadInstructions(mod);
+      ch |= dropDeadPhiCycles(mod);
       any |= ch;
       if (!ch) break;
     }
@@ -472,6 +507,7 @@ public:
     any |= dropWriteOnlyAllocas(mod);
     for (;;) {
       bool ch = dropDeadInstructions(mod);
+      ch |= dropDeadPhiCycles(mod);
       any |= ch;
       if (!ch) break;
     }
@@ -480,6 +516,70 @@ public:
 
 private:
   Layer layer_;
+
+  // A loop-carried variable that is assigned before it is ever read leaves a
+  // *cycle* of phis behind: each phi's incoming value is the next phi, and the
+  // value never reaches a real computation.  `dropDeadInstructions` cannot see
+  // them - every phi in the cycle does have a use, namely the next phi - so the
+  // register copies they lower to survive into the back-end, where they burn a
+  // register per iteration and, worse, count as an extra *use* of the value
+  // that feeds the cycle.  That stray use is what stops `% 2^k == c` from being
+  // folded to a single bit test in the bit-at-a-time kernels (`crc1`): the
+  // remainder is compared against a constant *and* copied into the dead cycle.
+  // Dropping the cycle is safe: a phi is pure, so its only effect is the value
+  // it defines.
+  bool dropDeadPhiCycles(Module &mod) {
+    // A/B switch: the fold this enables in the back-end is measured separately.
+    if (std::getenv("SAKU_NO_PHIDCE")) return false;
+    bool any = false;
+    for (auto &f : mod.functions()) {
+      if (f->isLib || f->blocks.empty()) continue;
+      std::vector<Instruction *> phis;
+      std::unordered_map<Instruction *, std::vector<Instruction *>> users;
+      for (auto &bb : f->blocks)
+        for (auto &iu : bb->instrs) {
+          Instruction *inst = iu.get();
+          if (inst->op == Op::Phi) phis.push_back(inst);
+          for (Value *o : inst->ops)
+            if (auto *oi = dynamic_cast<Instruction *>(o))
+              users[oi].push_back(inst);
+        }
+      if (phis.empty()) continue;
+      // A phi survives when it can reach a *root*: a user that is not a phi at
+      // all (so the value escapes into real computation), directly or through
+      // other live phis.  Starting from those roots and walking backwards marks
+      // every phi that some computation can observe; whatever is left is a
+      // closed cycle nothing reads.
+      std::unordered_set<Instruction *> live;
+      for (Instruction *p : phis)
+        for (Instruction *u : users[p])
+          if (u->op != Op::Phi) { live.insert(p); break; }
+      for (bool ch = true; ch;) {
+        ch = false;
+        for (Instruction *p : phis) {
+          if (live.count(p)) continue;
+          for (Instruction *u : users[p])
+            if (live.count(u)) { live.insert(p); ch = true; break; }
+        }
+      }
+      std::unordered_set<Instruction *> dead;
+      for (Instruction *p : phis)
+        if (!live.count(p)) dead.insert(p);
+      if (dead.empty()) continue;
+      for (auto &bb : f->blocks) {
+        auto &v = bb->instrs;
+        for (size_t i = 0; i < v.size();) {
+          if (dead.count(v[i].get())) {
+            v.erase(v.begin() + (long)i);
+            any = true;
+          } else {
+            ++i;
+          }
+        }
+      }
+    }
+    return any;
+  }
 
   bool dropDeadInstructions(Module &mod) {
     bool any = false;

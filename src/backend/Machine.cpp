@@ -98,7 +98,11 @@ OpSlots slots(const MInst &m) {
   case MOp::IDiv:
   case MOp::IRem:
   case MOp::Mulh:
+  case MOp::Mulhu:
+  case MOp::Mul64:
   case MOp::IXor:
+  case MOp::IAnd:
+  case MOp::IOr:
   case MOp::ISlt:
   case MOp::ISltu:
   case MOp::ICmp:
@@ -109,6 +113,7 @@ OpSlots slots(const MInst &m) {
   case MOp::IAddI:
   case MOp::INeg:
   case MOp::IXorI:
+  case MOp::IAndI:
   case MOp::ISlti:
   case MOp::ISltiu:
   case MOp::ISltuZ:
@@ -185,6 +190,11 @@ OpSlots slots(const MInst &m) {
   case MOp::SwF:
   case MOp::SwG:
   case MOp::SpillSw:
+    s.use[0] = m.a; s.useFile[0] = RF_X;
+    break;
+  case MOp::SdF:
+    // see Machine.h: always x0, so the operand is deliberately left off the
+    // use list (a < 0 is skipped by liveness and the post-RA read counters).
     s.use[0] = m.a; s.useFile[0] = RF_X;
     break;
   case MOp::FswF:

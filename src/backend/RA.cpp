@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,6 +80,68 @@ struct Allocator {
 
   std::vector<char> isF;
 
+  // Instruction kinds whose result can be recomputed from scratch anywhere in
+  // the function without reading any register or memory: integer / float
+  // constant materialisation.  Recomputation is preferred over spilling for
+  // these - `li` is one cheap instruction with no memory access, whereas a
+  // spill costs a store plus a load (and, in a loop, the reload repeats on
+  // every iteration).  `LeaGlobal` / `LeaFrame` are deliberately *not* here:
+  // an `la` expands to two instructions, so keeping the address alive in a
+  // register is better than rematerialising it inside a loop.
+  static bool isRematerializable(MOp op) {
+    switch (op) {
+    case MOp::Li:
+    case MOp::LiWide:
+    case MOp::LiF:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // vreg -> a copy of its *single* defining instruction, for vregs whose
+  // definition is rematerialisable.  A vreg with several definitions (ISel
+  // reuses a phi's vreg across predecessor copies) is excluded: recomputing
+  // one of them would not stand in for the others.  The defining instructions
+  // are copied because spillRound rewrites the block vectors in place.
+  std::unordered_map<int32_t, MInst> rematCandidates() const {
+    std::unordered_map<int32_t, int> defCount;
+    std::unordered_map<int32_t, MInst> def;
+    for (auto &b : f.blocks)
+      for (auto &m : b.instrs) {
+        if (m.dst < 0) continue;
+        ++defCount[m.dst];
+        if (isRematerializable(m.op))
+          def[m.dst] = m;
+        else
+          def.erase(m.dst);
+      }
+    // Reading a vreg costs the same as redefining it, so only clone where the
+    // result is actually used; and cap the fan-out so a value read all over a
+    // loop body is not expanded into a long run of `li`s.
+    std::unordered_map<int32_t, int> reads;
+    auto countReads = [&](const MInst &m) {
+      OpSlots s = slots(m);
+      for (int i = 0; i < 3; ++i)
+        if (s.use[i] >= 0) ++reads[s.use[i]];
+      if (m.op == MOp::Ret && m.a >= 0) ++reads[m.a];
+      if (m.op == MOp::Call)
+        for (const MArg &a : m.args)
+          if (a.vreg >= 0) ++reads[a.vreg];
+    };
+    for (auto &b : f.blocks)
+      for (auto &m : b.instrs) countReads(m);
+    std::unordered_map<int32_t, MInst> out;
+    for (auto &kv : def) {
+      int32_t r = kv.first;
+      if (defCount[r] != 1) continue;
+      auto it = reads.find(r);
+      if (it == reads.end() || it->second < 1 || it->second > 8) continue;
+      out[r] = kv.second;
+    }
+    return out;
+  }
+
   void computeFiles() {
     int n = maxReg();
     isF.assign((size_t)n, 0);
@@ -124,9 +187,12 @@ struct Allocator {
           case MOp::EntryStkInt: case MOp::EntryStkFlt:
           case MOp::IAdd: case MOp::IAddI: case MOp::ISub: case MOp::INeg:
           case MOp::IMul: case MOp::IDiv: case MOp::IRem: case MOp::Mulh:
+          case MOp::Mulhu: case MOp::Mul64:
           case MOp::SllI: case MOp::SrlI: case MOp::SraI:
           case MOp::Shl64I: case MOp::Shr64I: case MOp::Sar64I:
           case MOp::IXor: case MOp::IXorI:
+          case MOp::IAnd: case MOp::IAndI:
+          case MOp::IOr:
           case MOp::ISlt: case MOp::ISlti: case MOp::ISltu: case MOp::ISltiu:
           case MOp::ISltuZ: case MOp::ICmp: case MOp::FCmp:
           case MOp::FAdd: case MOp::FSub: case MOp::FMul: case MOp::FDiv:
@@ -194,6 +260,94 @@ struct Allocator {
     }
   }
 
+  // ---- spill cost --------------------------------------------------------
+  // Estimated cost of spilling each virtual register.  LLVM's greedy allocator
+  // orders spill candidates by `weight / degree`, where the weight of a live
+  // range is the sum over its defs and uses of a loop-depth multiplier
+  // (1 << depth, capped).  The point is the *exponential* factor: a value that
+  // is live across a loop body is reloaded on every iteration, so spilling it
+  // costs #iterations x more than spilling a value used once in the entry
+  // block.  Without that factor a Chaitin-Briggs simplify phase that gets
+  // stuck picks the highest-degree node, which is usually the hottest address
+  // or accumulator, and the reloads land straight inside the innermost loop.
+  std::vector<int64_t> spillWeight;
+
+  // Loop nesting depth per block, from the DFS back edges.  An edge u->v where
+  // v is still on the current DFS path closes a natural loop; every block on
+  // the path from v to u lies in its body and gets one more level of depth.
+  // This over-approximates when loops share a header (the on-path blocks are
+  // all marked), which only makes the *relative* weights more conservative --
+  // blocks outside every loop still end up with a strictly smaller multiplier.
+  void computeLoopDepth(std::vector<int> &depth) const {
+    const int32_t nb = (int32_t)f.blocks.size();
+    depth.assign((size_t)nb, 0);
+    std::vector<char> state((size_t)nb, 0); // 0 = new, 1 = on path, 2 = done
+    std::vector<int32_t> path;
+    struct Frame {
+      int32_t u;
+      size_t next;
+    };
+    std::vector<Frame> st;
+    for (int32_t root = 0; root < nb; ++root) {
+      if (state[(size_t)root]) continue;
+      state[(size_t)root] = 1;
+      path.push_back(root);
+      st.push_back({root, 0});
+      while (!st.empty()) {
+        Frame &fr = st.back();
+        const auto &sc = succ[(size_t)fr.u];
+        if (fr.next < sc.size()) {
+          int32_t v = sc[fr.next++];
+          if (v < 0 || v >= nb) continue;
+          if (state[(size_t)v] == 1) {
+            for (size_t k = path.size(); k-- > 0;) {
+              ++depth[(size_t)path[k]];
+              if (path[k] == v) break;
+            }
+          } else if (state[(size_t)v] == 0) {
+            state[(size_t)v] = 1;
+            path.push_back(v);
+            st.push_back({v, 0});
+          }
+        } else {
+          state[(size_t)fr.u] = 2;
+          path.pop_back();
+          st.pop_back();
+        }
+      }
+    }
+  }
+
+  void computeSpillWeights() {
+    spillWeight.assign((size_t)std::max(1, nreg), 0);
+    if (f.blocks.empty()) return;
+    // With the weights all zero the stuck branch degenerates to "highest
+    // degree wins", i.e. the behaviour before loop-depth weighting, so this
+    // doubles as an exact A/B switch for benchmarking.
+    static const bool off = std::getenv("SAKU_NO_SPILLW") != nullptr;
+    if (off) return;
+    std::vector<int> depth;
+    computeLoopDepth(depth);
+    for (size_t bi = 0; bi < f.blocks.size(); ++bi) {
+      int d = depth[bi];
+      if (d > 12) d = 12;
+      const int64_t w = (int64_t)1 << d;
+      for (const auto &m : f.blocks[bi].instrs) {
+        OpSlots sl = slots(m);
+        if (sl.def >= 0 && sl.def < (int32_t)spillWeight.size())
+          spillWeight[(size_t)sl.def] += w;
+        for (int k = 0; k < 3; ++k)
+          if (sl.use[k] >= 0 && sl.use[k] < (int32_t)spillWeight.size())
+            spillWeight[(size_t)sl.use[k]] += w;
+      }
+    }
+  }
+
+  int64_t weightOf(int32_t r) const {
+    if (r < 0 || r >= (int32_t)spillWeight.size()) return 0;
+    return spillWeight[(size_t)r];
+  }
+
   // ---- liveness ----------------------------------------------------------
   std::vector<std::vector<char>> liveIn, liveOut;
 
@@ -204,15 +358,22 @@ struct Allocator {
     for (size_t k = insts.size(); k-- > 0;) {
       MInst &m = insts[k];
       OpSlots sl = slots(m);
+      // live_in = (live_out - def) + uses.  The order matters: an instruction
+      // may read and write the *same* virtual register (a coalesced in-place
+      // induction update `addiw iv, iv, 4`, or any two-address op).  Killing
+      // the definition must therefore happen before the uses are added back,
+      // otherwise the self-use is erased and the value looks dead before the
+      // instruction, which under-approximates interference and can colour two
+      // simultaneously-live values into one register.
+      auto kill = [&](int r) {
+        if (r >= 0 && r < n) live[(size_t)r] = 0;
+      };
+      kill(sl.def);
       auto touch = [&](int r) {
         if (r >= 0 && r < n) live[(size_t)r] = 1;
       };
       for (int j = 0; j < 3; ++j) touch(sl.use[j]);
       for (auto &a : m.args) touch(a.vreg);
-      auto kill = [&](int r) {
-        if (r >= 0 && r < n) live[(size_t)r] = 0;
-      };
-      kill(sl.def);
     }
   }
 
@@ -260,12 +421,14 @@ struct Allocator {
           for (int32_t r = 0; r < n; ++r)
             if (live[(size_t)r] && r != m.dst) crossing[(size_t)r] = 1;
         }
+        // same order as transfer(): kill the definition, then add the uses,
+        // so an in-place read-modify-write keeps its source live.
+        if (sl.def >= 0 && sl.def < n) live[(size_t)sl.def] = 0;
         auto touch = [&](int r) {
           if (r >= 0 && r < n) live[(size_t)r] = 1;
         };
         for (int j = 0; j < 3; ++j) touch(sl.use[j]);
         for (auto &a : m.args) touch(a.vreg);
-        if (sl.def >= 0 && sl.def < n) live[(size_t)sl.def] = 0;
       }
     }
   }
@@ -365,9 +528,12 @@ struct Allocator {
         auto touch = [&](int r) {
           if (r >= 0 && r < n) live[(size_t)r] = 1;
         };
+        // kill the definition first, then re-add uses (see transfer()): an
+        // instruction that reads and writes the same register keeps that
+        // register live across the instruction.
+        if (def >= 0 && def < n) live[(size_t)def] = 0;
         for (int j = 0; j < 3; ++j) touch(sl.use[j]);
         for (auto &a : m.args) touch(a.vreg);
-        if (def >= 0 && def < n) live[(size_t)def] = 0;
       }
     }
   }
@@ -382,8 +548,11 @@ struct Allocator {
                  std::vector<std::vector<char>> &adj,
                  const std::vector<char> &crossing,
                  const std::vector<std::vector<char>> &forbid,
-                 std::vector<int32_t> &color, const int *calPhys, int Kcal,
-                 const int *fullPhys, int Kfull) {
+                 std::vector<int32_t> &color,
+                 const std::vector<int32_t> &idx,
+                 const std::unordered_map<int32_t, std::vector<int32_t>> &partners,
+                 const int *calPhys, int Kcal, const int *fullPhys,
+                 int Kfull, bool degreeRule) {
     int32_t n = (int32_t)nodes.size();
     std::vector<char> removed((size_t)n, 0);
     std::vector<char> cand((size_t)n, 0);
@@ -409,15 +578,59 @@ struct Allocator {
         }
       }
       if (pick < 0) {
-        int32_t maxd = -1;
-        for (int32_t i = 0; i < n; ++i) {
-          if (removed[(size_t)i]) continue;
-          int32_t d = degree(i);
-          if (d > maxd) {
-            maxd = d;
-            pick = i;
+        // No node can be simplified, so one of them has to live in memory.
+        // Two candidate rules:
+        //
+        //  * cost (default): cheapest cost per interference edge removed,
+        //    LLVM's greedy-allocator ordering by weight/degree.  The cost of a
+        //    live range grows with how often it is touched, which is
+        //    exponential in loop depth (a value live across a loop is reloaded
+        //    once per trip), so this keeps the accumulator and the innermost
+        //    address in registers.
+        //  * degree (fallback): the classical highest-degree rule.  The cost
+        //    rule is only a heuristic and can stall: spilling the cheapest
+        //    node may remove no edges at all, so the retry loop keeps
+        //    uncolouring a new set of vregs while the spill code it inserts
+        //    adds more pressure than the spill removed (measured on
+        //    functional/87_many_params: +10 vregs per round, never
+        //    converging).  The caller switches to this rule as soon as a retry
+        //    fails to shrink the uncoloured set.
+        int32_t best = -1;
+        if (degreeRule) {
+          int32_t maxd = -1;
+          for (int32_t i = 0; i < n; ++i) {
+            if (removed[(size_t)i]) continue;
+            int32_t d = degree(i);
+            if (d > maxd) {
+              maxd = d;
+              best = i;
+            }
+          }
+        } else {
+          int64_t bestW = 0;
+          int32_t bestD = -1;
+          for (int32_t i = 0; i < n; ++i) {
+            if (removed[(size_t)i]) continue;
+            int64_t w = weightOf(nodes[(size_t)i]);
+            int32_t d = degree(i);
+            if (d < 1) d = 1;
+            if (best < 0) {
+              best = i;
+              bestW = w;
+              bestD = d;
+              continue;
+            }
+            // cross-multiplied w/d < bestW/bestD
+            bool better = w * (int64_t)bestD < bestW * (int64_t)d;
+            if (!better && w == bestW && d > bestD) better = true;
+            if (better) {
+              best = i;
+              bestW = w;
+              bestD = d;
+            }
           }
         }
+        pick = best;
         if (pick < 0) break;
         cand[(size_t)pick] = 1;
       }
@@ -438,7 +651,32 @@ struct Allocator {
         if (forbid[(size_t)i][(size_t)pr]) used[(size_t)pr] = 1;
       const int *pal = crossing[(size_t)nodes[(size_t)i]] ? calPhys : fullPhys;
       int32_t ch = -1;
-      for (int32_t ci = 0; ci < K; ++ci) {
+      // Copy-coalescing hint: try a register already chosen for a value this
+      // one is copied to/from.  If they end up in the same register the copy
+      // vanishes (self move).  This only reorders the choice among colours
+      // that are already legal (unused by an interfering neighbour and not
+      // forbidden), so it can never introduce an interference violation.
+      auto pit = partners.find(nodes[(size_t)i]);
+      if (pit != partners.end()) {
+        for (int32_t pv : pit->second) {
+          if (pv < 0 || pv >= (int32_t)idx.size()) continue;
+          int32_t pj = idx[(size_t)pv];
+          if (pj < 0) continue;
+          int32_t pc = c[(size_t)pj];
+          if (pc < 0 || pc >= 32 || used[(size_t)pc]) continue;
+          bool inPal = false;
+          for (int32_t ci = 0; ci < K; ++ci)
+            if (pal[ci] == pc) {
+              inPal = true;
+              break;
+            }
+          if (inPal) {
+            ch = pc;
+            break;
+          }
+        }
+      }
+      for (int32_t ci = 0; ch < 0 && ci < K; ++ci) {
         if (!used[(size_t)pal[ci]]) {
           ch = pal[ci];
           break;
@@ -485,12 +723,32 @@ struct Allocator {
   // insert spill loads/stores for vregs marked in `spilled`.  Spill slot
   // numbers keep growing across rounds (f.spillCount) so that values spilled
   // in earlier rounds never share a memory slot with later spills.
-  void spillRound(const std::vector<char> &spilled) {
+  //
+  // Values in `remat` are not spilled at all: their single definition is a
+  // constant or an address materialisation, so it is cheaper (and, in a loop,
+  // removes a memory access from every iteration) to recompute the value at
+  // each use than to reload it from a slot.  Every read of such a vreg is
+  // replaced by a fresh copy of the defining instruction and the original
+  // definition is dropped, so the vreg disappears exactly like a spilled one.
+  void spillRound(const std::vector<char> &spilled,
+                  const std::unordered_map<int32_t, MInst> &cands) {
     int n = maxReg();
+    // Rematerialise only what would otherwise go to a spill slot.  This is
+    // LLVM's rule (a clone stands in for a reload, it is not a substitute for
+    // keeping the value in a register) and it matters a lot in loops: machine
+    // LICM hoists one `li` per constant into the preheader so the loop body
+    // reads a register, and cloning every read would put the `li` straight
+    // back inside the body - undoing the hoist and paying for the *definition*
+    // of the constant on every iteration.
+    std::unordered_map<int32_t, MInst> remat;
+    for (const auto &kv : cands)
+      if (kv.first >= 0 && kv.first < (int32_t)spilled.size() &&
+          spilled[(size_t)kv.first])
+        remat.emplace(kv.first, kv.second);
     std::vector<int32_t> slot((size_t)n, -1);
     int nextSlot = f.spillCount;
     for (int32_t r = 0; r < n; ++r)
-      if (spilled[(size_t)r]) slot[(size_t)r] = nextSlot++;
+      if (spilled[(size_t)r] && !remat.count(r)) slot[(size_t)r] = nextSlot++;
 
     for (auto &b : f.blocks) {
       std::vector<MInst> out;
@@ -498,7 +756,18 @@ struct Allocator {
       for (auto &m : b.instrs) {
         std::unordered_map<int32_t, int32_t> tmpFor;
         auto loadUse = [&](int32_t r) -> int32_t {
-          if (r < 0 || slot[(size_t)r] < 0) return r;
+          if (r < 0) return r;
+          auto rit = remat.find(r);
+          if (rit != remat.end()) {
+            auto it = tmpFor.find(r);
+            if (it != tmpFor.end()) return it->second;
+            MInst c = rit->second; // clone the cheap definition
+            c.dst = nreg++;
+            out.push_back(c);
+            tmpFor[r] = c.dst;
+            return c.dst;
+          }
+          if (slot[(size_t)r] < 0) return r;
           auto it = tmpFor.find(r);
           if (it != tmpFor.end()) return it->second;
           MInst t;
@@ -532,6 +801,18 @@ struct Allocator {
       }
       b.instrs = std::move(out);
     }
+    // every read of a rematerialised vreg was rewritten, so its original
+    // definition (which no longer has a slot) is now dead
+    if (!remat.empty())
+      for (auto &b : f.blocks) {
+        auto &v = b.instrs;
+        for (size_t i = 0; i < v.size();) {
+          if (v[i].dst >= 0 && remat.count(v[i].dst))
+            v.erase(v.begin() + (long)i);
+          else
+            ++i;
+        }
+      }
     f.spillCount = nextSlot;
   }
 };
@@ -547,13 +828,19 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
     A.buildCFG();
 
     std::vector<int32_t> color; // vreg -> physical register
-    int round = 0;
-    for (; round < 24; ++round) {
+    int prevUncolored = INT32_MAX;
+    // One colouring attempt.  Fills `color` and returns true on success; on
+    // failure it rewrites the function to spill what could not be coloured
+    // (`forceAll` spills every vreg, the last resort) and reports the number
+    // of uncoloured vregs through `uncolored`.
+    auto attempt = [&](bool forceAll, bool degreeRule,
+                       int *uncolored) -> bool {
       A.nreg = A.maxReg();
       A.computeFiles();
       std::vector<char> crossing;
       A.computeLiveness(crossing);
       A.buildCFG();
+      A.computeSpillWeights();
       A.buildGraph();
 
       int n = A.maxReg();
@@ -561,22 +848,74 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
       std::vector<int32_t> cX((size_t)n, -1), cF((size_t)n, -1);
       auto fX = A.entryForbid(A.xNodes, A.xIdx, false);
       auto fF = A.entryForbid(A.fNodes, A.fIdx, true);
-      bool okX = A.colorFile(A.xNodes, A.adjX, crossing, fX, cX,
-                             kXCalleePhys, kXCallee, kXFullPhys, kXFull);
-      bool okF = A.colorFile(A.fNodes, A.adjF, crossing, fF, cF,
-                             kFCalleePhys, kFCallee, kFFullPhys, kFFull);
+      // Move partners (both directions) so colouring can keep a copy's two
+      // ends in one register and retire the copy.
+      std::unordered_map<int32_t, std::vector<int32_t>> partners;
+      for (auto &b : f.blocks)
+        for (auto &m : b.instrs)
+          if ((m.op == MOp::MoveX || m.op == MOp::MoveF) && m.dst >= 0 &&
+              m.a >= 0) {
+            partners[m.dst].push_back(m.a);
+            partners[m.a].push_back(m.dst);
+          }
+      bool okX = A.colorFile(A.xNodes, A.adjX, crossing, fX, cX, A.xIdx,
+                             partners, kXCalleePhys, kXCallee, kXFullPhys,
+                             kXFull, degreeRule);
+      bool okF = A.colorFile(A.fNodes, A.adjF, crossing, fF, cF, A.fIdx,
+                             partners, kFCalleePhys, kFCallee, kFFullPhys,
+                             kFFull, degreeRule);
       if (okX && okF) {
         for (int32_t r = 0; r < n; ++r)
           color[(size_t)r] = cX[(size_t)r] >= 0 ? cX[(size_t)r] : cF[(size_t)r];
-        break;
+        return true;
       }
-      std::vector<char> spilled((size_t)n, 0);
-      for (int32_t r : A.xNodes)
-        if (cX[(size_t)r] < 0) spilled[(size_t)r] = 1;
-      for (int32_t r : A.fNodes)
-        if (cF[(size_t)r] < 0) spilled[(size_t)r] = 1;
-      A.spillRound(spilled);
+      std::vector<char> spilled((size_t)n, forceAll ? 1 : 0);
+      int nUncolored = 0;
+      if (!forceAll) {
+        for (int32_t r : A.xNodes)
+          if (cX[(size_t)r] < 0) {
+            spilled[(size_t)r] = 1;
+            ++nUncolored;
+          }
+        for (int32_t r : A.fNodes)
+          if (cF[(size_t)r] < 0) {
+            spilled[(size_t)r] = 1;
+            ++nUncolored;
+          }
+      }
+      if (uncolored) *uncolored = nUncolored;
+      A.spillRound(spilled, forceAll ? std::unordered_map<int32_t, MInst>{}
+                                     : A.rematCandidates());
+      return false;
+    };
+
+    bool converged = false;
+    bool degreeRule = false;
+    for (int round = 0; round < 24 && !converged; ++round) {
+      int uncolored = 0;
+      converged = attempt(false, degreeRule, &uncolored);
+      // Livelock guard: if spilling did not shrink the uncoloured set, the
+      // cost heuristic is not breaking whatever clique is blocking us (it can
+      // pick a node of degree 0 and remove nothing).  Switch to the classical
+      // highest-degree rule, which maximises the edges removed per spill.
+      // Without this the retry loop can grow the function by ~10 vregs per
+      // round and never converge.
+      if (!converged && uncolored >= prevUncolored) degreeRule = true;
+      prevUncolored = uncolored;
     }
+    // Belt and braces: if even 24 retries failed there is no colouring at all
+    // (`color` is still all -1), and baking that in would print -1 as a
+    // register number.  Spill everything instead: every value is then loaded
+    // immediately before its use and stored immediately after, so every live
+    // range spans a single instruction and the next attempt must succeed.
+    // The result is slow code, but only for a function the allocator already
+    // could not handle, and it is correct.
+    int fallbackGuard = 0;
+    while (!converged && fallbackGuard++ < 8) {
+      int uncolored = 0;
+      converged = attempt(true, true, &uncolored);
+    }
+    assert(converged && "register allocation failed to converge");
 
     // record used callee-saved registers (from colouring)
     for (int32_t r = 0; r < (int32_t)color.size(); ++r) {

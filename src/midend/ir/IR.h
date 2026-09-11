@@ -112,6 +112,11 @@ enum class Op : uint8_t {
   ICmp, FCmp,                     // arith.{cmpi, cmpf}; produce i32 0/1
   Sitofp, Fptosi,                 // arith.{sitofp, fptosi}
   Not,                            // arith.xori with i32 1  ('!' on a 0/1 value)
+  // arith.select %c, %a, %b - pick `a` when the i32 condition `c` is non-zero,
+  // `b` otherwise.  Formed by the if-converter from a two-entry diamond whose
+  // arms are pure, and lowered by the back-end to a mask sequence instead of a
+  // branch (RISC-V has no conditional move):  mask = -c; res = b ^ ((a^b) & mask).
+  Select,                         // ops = [cond, trueVal, falseVal]
 
   // tensor dialect: whole-tensor memory operations.  These keep the tensor
   // semantics of the source language intact (a tensor is a first-class value

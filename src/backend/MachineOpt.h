@@ -53,6 +53,11 @@ public:
   // Returns the number of div/rem/mul instructions rewritten.
   size_t strengthReduction(std::vector<MachineFunc> &fns);
 
+  // Coalesce zero-fill frame stores: a run of `sw x0` zero initialisations
+  // becomes `sd x0` pairs, and the constant materialisation they used is left
+  // for the peephole round to delete.  Returns the number of rewrites.
+  size_t zeroFill(std::vector<MachineFunc> &fns);
+
   // Drop dead/self/zero-extending moves and fold trivial arithmetic.
   // Returns the number of machine instructions eliminated.
   size_t peephole(std::vector<MachineFunc> &fns);
@@ -70,6 +75,24 @@ public:
   // loops into their preheader.  Returns the number of instructions hoisted.
   size_t licm(std::vector<MachineFunc> &fns);
 
+  // Global (dominator-tree) CSE of constant / address materialisations
+  // (`li`/`la`/frame addresses).  Machine-level LICM hoists one copy of each
+  // invariant materialisation per loop body, so the same `la A` can land in
+  // the preheader several times once the inliner has duplicated a loop; this
+  // folds those duplicates (and any duplicate across blocks) onto the
+  // dominating definition.  It is the machine-level counterpart of LLVM's
+  // MachineCSE, deliberately restricted to instructions with no register
+  // operand so that a dominating definition is unconditionally a legal
+  // replacement.  Returns the number of instructions eliminated.
+  size_t globalCse(std::vector<MachineFunc> &fns);
+
+  // Pre-register-allocation copy folding: retarget the definition that feeds a
+  // register copy at the copy's destination when the source has no other
+  // reader, so the copy disappears before colouring (the virtual-register form
+  // of coalescing).  Loop-latch induction updates `addiw t, iv, 4; mv iv, t`
+  // are the canonical case.  Returns the number of copies eliminated.
+  size_t coalesceMoves(std::vector<MachineFunc> &fns);
+
   // ---- post-register-allocation (operates on physical registers) ---------
 
   // Second peephole: eliminate the redundant register moves that colouring
@@ -78,6 +101,13 @@ public:
   // consumed immediately by the next store.  Returns the number of
   // instructions eliminated.
   size_t removeRedundantMoves(std::vector<MachineFunc> &fns);
+
+  // Post-register-allocation loop rotation by block layout: sink a loop header
+  // to its latch so the unconditional back edge becomes the physical
+  // fall-through and only the conditional branch is paid per iteration.  Only
+  // the block order and the layout-dependent terminators change; the CFG and
+  // every register/operand is untouched.  Returns the number of loops rotated.
+  size_t rotateLoopsByLayout(std::vector<MachineFunc> &fns);
 };
 
 } // namespace backend

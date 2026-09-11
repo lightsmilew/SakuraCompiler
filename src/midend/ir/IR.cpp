@@ -160,6 +160,7 @@ const char *opMnemonic(Op o) {
   case Op::Sitofp: return "sitofp";
   case Op::Fptosi: return "fptosi";
   case Op::Not:    return "xori";
+  case Op::Select: return "select";
   case Op::TAddI:  return "addi";
   case Op::TAddF:  return "addf";
   case Op::TSubI:  return "subi";
@@ -558,6 +559,12 @@ std::string Module::toString() {
               break;
             }
           }
+          break;
+        }
+        case Op::Select: {
+          os << "arith.select " << nameOf(inst->ops[0]) << ", "
+             << nameOf(inst->ops[1]) << ", " << nameOf(inst->ops[2]) << " : "
+             << typeStr(inst->ty);
           break;
         }
         case Op::Call: {

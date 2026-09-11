@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../midend/ir/IR.h"
@@ -57,6 +58,14 @@ enum class MOp : uint8_t {
   INeg,          // dst = -a
   IMul, IDiv, IRem,
   Mulh,          // dst = high 64 bits of a * b (signed 64x64, raw result)
+  Mulhu,         // dst = high 32 bits of a * b (unsigned 32x32): `mulhu`
+  // low 64 bits of a * b (signed 64x64): `mul`.  Unlike IMul (which is the
+  // 32-bit `mulw`), this is a raw 64-bit value with no i32 sign-extension
+  // guarantee.  It is the multiply LLVM's RISC-V backend uses to build an
+  // i32 constant division: both factors are sign-extended and the high half
+  // of the product is recovered with a following `srai`, so no `mulh` is
+  // needed.
+  Mul64,
   // 32-bit word shifts (slliw/srliw/sraiw): canonical sign-extended results,
   // shift amount in imm (0..31).
   SllI, SrlI, SraI,
@@ -64,6 +73,8 @@ enum class MOp : uint8_t {
   // result is a raw 64-bit value (no i32 sign-extension guarantee).
   Shl64I, Shr64I, Sar64I,
   IXor, IXorI,   // dst = a ^ b | a ^ imm
+  IAnd, IAndI,   // dst = a & b | a & imm
+  IOr,           // dst = a | b
   ISlt,          // dst = (a < b) signed
   ISlti,         // dst = (a < imm)
   ISltu,         // dst = (a <u b)
@@ -86,6 +97,12 @@ enum class MOp : uint8_t {
 
   // memory: fused frame / global / spill addressing
   LwF, FlwF, SwF, FswF,   // imm = local frame byte offset (value in `a` for stores)
+  SdF,           // *(i64)[sp + localBase + imm] = x0
+                 //   Only ever produced by zeroStoreCoalesce (see MachineOpt.cpp)
+                 //   and only ever with a == -1 (x0): two adjacent `SwF x0`
+                 //   zero stores fused into one 8-byte store.  A general
+                 //   register source would be wrong here (the high 32 bits of
+                 //   the saved value are not the intended second word).
   LwG, FlwG, SwG, FswG,   // sym = global, imm = byte displacement
   SpillLw, SpillFlw, SpillSw, SpillFsw,  // imm = spill-slot index
 
@@ -132,6 +149,11 @@ struct MachineFunc {
   int localBytes = 0;           // frame bytes for ISel-assigned locals
   int spillCount = 0;           // number of RA spill slots
   int maxStkArgBytes = 0;       // max outbound stack argument bytes
+  // Virtual registers whose value is provably in [0, 2^31) (ISel's range
+  // analysis).  The constant-division strength reducer uses it to pick the
+  // unsigned magic sequence, which needs no sign correction.  Only consulted
+  // before register allocation, on the vregs ISel produced.
+  std::unordered_set<int> nonNeg;
 };
 
 // --------------------------------------------------------------------------

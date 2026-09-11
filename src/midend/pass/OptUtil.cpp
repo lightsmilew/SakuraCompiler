@@ -160,6 +160,7 @@ bool isPure(Op o) {
   case Op::Sitofp:
   case Op::Fptosi:
   case Op::Not:
+  case Op::Select:
   case Op::Load: // loads have no side effects; dropping a dead load is safe
     return true;
   default:

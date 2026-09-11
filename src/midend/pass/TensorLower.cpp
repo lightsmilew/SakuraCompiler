@@ -279,13 +279,15 @@ private:
   }
 
   // ---- matmul -----------------------------------------------------------
-  // dest[M,P] = a[M,N] @ b[N,P], expanded as the canonical kij affine nest:
+  // dest[M,P] = a[M,N] @ b[N,P], expanded in cache-friendly *ikj* order:
   //   affine.for i in [0,M):
-  //     affine.for j in [0,P):
-  //       acc = 0
-  //       affine.for k in [0,N):
-  //         acc += a[i][k] * b[k][j]
-  //       dest[i][j] = acc
+  //     affine.for j in [0,P): dest[i][j] = 0
+  //     affine.for k in [0,N):
+  //       aik = a[i][k]                // hoisted across j
+  //       affine.for j in [0,P):
+  //         dest[i][j] += aik * b[k][j]
+  // Streaming b and dest along rows beats the classic ijk nest (which walks
+  // b down a column) on large matrices; matches LLVM LoopInterchange intent.
   void expandMatmul(std::vector<std::unique_ptr<BasicBlock>> &list, size_t bi,
                     size_t k) {
     BasicBlock *b = list[bi].get();
@@ -304,104 +306,109 @@ private:
     BasicBlock *exit = splitAfter(list, bi, k);
     b->instrs.pop_back();
 
-    // Induction slots for i / j / k and the per-(i,j) accumulator.
     Instruction *si = emitSlot(b, line);
     Instruction *sj = emitSlot(b, line);
     Instruction *sk = emitSlot(b, line);
-    Instruction *sac = emitSlot(b, line, elem);
     ConstantInt *c4 = mod_->constInt(4);
+    Value *zero = isF ? (Value *)mod_->constFloat(0.0f)
+                      : (Value *)mod_->constInt(0);
 
-    // i loop (its exit is `exit`, the block that followed the matmul)
+    auto rowMajorOffInto = [&](BasicBlock *bb, Value *r1, int64_t stride,
+                               Value *r2) {
+      Instruction *m = emitTo(bb, Op::Mul, Type::I32, line);
+      m->ops = {r1, mod_->constInt((int32_t)stride)};
+      Instruction *a = emitTo(bb, Op::Add, Type::I32, line);
+      a->ops = {m, r2};
+      Instruction *x = emitTo(bb, Op::Mul, Type::I32, line);
+      x->ops = {a, c4};
+      return x;
+    };
+
+    // i loop
     Instruction *fI = emitFor(b, si, M, exit, line);
     regStack_.push_back(&fI->bodyRegion);
     BasicBlock *bI = newBlock();
-    BasicBlock *exitJ = newBlock(); // j-loop exit (sibling of bI in this region)
+    BasicBlock *exitZero = newBlock();
+    BasicBlock *exitK = newBlock();
 
-    // j loop
-    Instruction *fJ = emitFor(bI, sj, P, exitJ, line);
-    regStack_.push_back(&fJ->bodyRegion);
-    BasicBlock *bJ = newBlock();
-    BasicBlock *exitK = newBlock(); // k-loop exit (sibling of bJ in this region)
-
-    // acc = 0
+    // ---- zero dest[i][*] ------------------------------------------------
+    Instruction *fZ = emitFor(bI, sj, P, exitZero, line);
+    regStack_.push_back(&fZ->bodyRegion);
+    BasicBlock *bZ = newBlock();
     {
-      Value *zero = isF ? (Value *)mod_->constFloat(0.0f)
-                        : (Value *)mod_->constInt(0);
-      Instruction *st = emitTo(bJ, Op::Store, Type::Void, line);
-      st->ops = {zero, sac};
+      Instruction *iv = emitTo(bZ, Op::Load, Type::I32, line);
+      iv->ops = {si};
+      Instruction *jv = emitTo(bZ, Op::Load, Type::I32, line);
+      jv->ops = {sj};
+      Instruction *off = rowMajorOffInto(bZ, iv, P, jv);
+      Instruction *addr = emitGepInto(bZ, cBase, off, line);
+      Instruction *st = emitTo(bZ, Op::Store, Type::Void, line);
+      st->ops = {zero, addr};
+      emitTo(bZ, Op::AffineYield, Type::Void, line);
     }
+    regStack_.pop_back();
 
-    // k loop
-    Instruction *fK = emitFor(bJ, sk, N, exitK, line);
+    // ---- k loop (exitZero falls into the k-loop header) -----------------
+    Instruction *fK = emitFor(exitZero, sk, N, exitK, line);
     regStack_.push_back(&fK->bodyRegion);
     BasicBlock *bK = newBlock();
+    BasicBlock *exitJ = newBlock();
 
-    // inner body: acc += a[i][k] * b[k][j]
+    // aik = a[i][k]
+    Instruction *aikSlot = emitSlot(bK, line, elem);
     {
       Instruction *iv = emitTo(bK, Op::Load, Type::I32, line);
       iv->ops = {si};
-      Instruction *jv = emitTo(bK, Op::Load, Type::I32, line);
-      jv->ops = {sj};
       Instruction *kv = emitTo(bK, Op::Load, Type::I32, line);
       kv->ops = {sk};
-
-      auto rowMajorOff = [&](Value *r1, int64_t stride, Value *r2) {
-        // (r1 * stride + r2) * 4
-        Instruction *m = emitTo(bK, Op::Mul, Type::I32, line);
-        m->ops = {r1, mod_->constInt((int32_t)stride)};
-        Instruction *a = emitTo(bK, Op::Add, Type::I32, line);
-        a->ops = {m, r2};
-        Instruction *x = emitTo(bK, Op::Mul, Type::I32, line);
-        x->ops = {a, c4};
-        return x;
-      };
-
-      Instruction *aOff = rowMajorOff(iv, N, kv); // a[i][k]
-      Instruction *bOff = rowMajorOff(kv, P, jv); // b[k][j]
+      Instruction *aOff = rowMajorOffInto(bK, iv, N, kv);
       Instruction *aAddr = emitGepInto(bK, aBase, aOff, line);
-      Instruction *bAddr = emitGepInto(bK, bBase, bOff, line);
       Instruction *av = emitTo(bK, Op::Load, elem, line);
       av->ops = {aAddr};
-      Instruction *bv = emitTo(bK, Op::Load, elem, line);
-      bv->ops = {bAddr};
-      Instruction *acc = emitTo(bK, Op::Load, elem, line);
-      acc->ops = {sac};
-
-      Instruction *prod = emitTo(bK, isF ? Op::FMul : Op::Mul, elem, line);
-      prod->ops = {av, bv};
-      Instruction *sum = emitTo(bK, isF ? Op::FAdd : Op::Add, elem, line);
-      sum->ops = {acc, prod};
       Instruction *st = emitTo(bK, Op::Store, Type::Void, line);
-      st->ops = {sum, sac};
-      emitTo(bK, Op::AffineYield, Type::Void, line);
+      st->ops = {av, aikSlot};
     }
-    regStack_.pop_back(); // end of the k-loop body region
 
-    // j-loop tail (exit of the k loop): dest[i][j] = acc
+    // j loop: dest[i][j] += aik * b[k][j]
+    Instruction *fJ = emitFor(bK, sj, P, exitJ, line);
+    regStack_.push_back(&fJ->bodyRegion);
+    BasicBlock *bJ = newBlock();
     {
-      Instruction *iv = emitTo(exitK, Op::Load, Type::I32, line);
+      Instruction *iv = emitTo(bJ, Op::Load, Type::I32, line);
       iv->ops = {si};
-      Instruction *jv = emitTo(exitK, Op::Load, Type::I32, line);
+      Instruction *jv = emitTo(bJ, Op::Load, Type::I32, line);
       jv->ops = {sj};
-      Instruction *acc = emitTo(exitK, Op::Load, elem, line);
-      acc->ops = {sac};
+      Instruction *kv = emitTo(bJ, Op::Load, Type::I32, line);
+      kv->ops = {sk};
 
-      Instruction *m = emitTo(exitK, Op::Mul, Type::I32, line);
-      m->ops = {iv, mod_->constInt((int32_t)P)};
-      Instruction *a = emitTo(exitK, Op::Add, Type::I32, line);
-      a->ops = {m, jv};
-      Instruction *x = emitTo(exitK, Op::Mul, Type::I32, line);
-      x->ops = {a, c4};
-      Instruction *cAddr = emitGepInto(exitK, cBase, x, line);
-      Instruction *st = emitTo(exitK, Op::Store, Type::Void, line);
-      st->ops = {acc, cAddr};
-      emitTo(exitK, Op::AffineYield, Type::Void, line);
+      Instruction *cOff = rowMajorOffInto(bJ, iv, P, jv);
+      Instruction *cAddr = emitGepInto(bJ, cBase, cOff, line);
+      Instruction *cv = emitTo(bJ, Op::Load, elem, line);
+      cv->ops = {cAddr};
+
+      Instruction *bOff = rowMajorOffInto(bJ, kv, P, jv);
+      Instruction *bAddr = emitGepInto(bJ, bBase, bOff, line);
+      Instruction *bv = emitTo(bJ, Op::Load, elem, line);
+      bv->ops = {bAddr};
+
+      Instruction *aik = emitTo(bJ, Op::Load, elem, line);
+      aik->ops = {aikSlot};
+
+      Instruction *prod = emitTo(bJ, isF ? Op::FMul : Op::Mul, elem, line);
+      prod->ops = {aik, bv};
+      Instruction *sum = emitTo(bJ, isF ? Op::FAdd : Op::Add, elem, line);
+      sum->ops = {cv, prod};
+      Instruction *st = emitTo(bJ, Op::Store, Type::Void, line);
+      st->ops = {sum, cAddr};
+      emitTo(bJ, Op::AffineYield, Type::Void, line);
     }
-    regStack_.pop_back(); // end of the j-loop body region
+    regStack_.pop_back(); // j
 
-    // i-loop tail (exit of the j loop): nothing left to do, close the region
     emitTo(exitJ, Op::AffineYield, Type::Void, line);
-    regStack_.pop_back(); // end of the i-loop body region
+    regStack_.pop_back(); // k
+
+    emitTo(exitK, Op::AffineYield, Type::Void, line);
+    regStack_.pop_back(); // i
   }
 };
 
