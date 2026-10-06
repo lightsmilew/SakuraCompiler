@@ -579,7 +579,7 @@ private:
     if (const ConstantInt *l = asConstInt(lb))
       if (const ConstantInt *u = asConstInt(ub)) {
         constRange = true;
-        trips = u->v - l->v;
+        trips = int64_t(u->v) - l->v;
       }
     if (constRange && trips < kPartialFactor) return false;
     if (constRange && trips <= 0) return false;
@@ -621,7 +621,9 @@ private:
 
     Value *ubMain = ub;
     if (needRem) {
-      // ubMain = lb + ((ub-lb) - (ub-lb) % 4), inserted just before the loop.
+      // Clamp zero-trip domains and compute the distance modulo four using
+      // the endpoints' residues. ub-lb can overflow i32 even when the original
+      // loop and both endpoints are valid (e.g. lb near INT_MIN, ub > 0).
       size_t at = idx;
       auto emitPre = [&](Op op, Type ty) -> Instruction * {
         auto u = std::make_unique<Instruction>(op, ty);
@@ -630,15 +632,26 @@ private:
         instrs.insert(instrs.begin() + (long)at++, std::move(u));
         return p;
       };
+      Instruction *cmp = emitPre(Op::ICmp, Type::I32);
+      cmp->cond = Cond::Lt; cmp->ops = {ub, lb};
+      Instruction *end = emitPre(Op::Select, Type::I32);
+      end->ops = {cmp, lb, ub};
+      Instruction *ur = emitPre(Op::SRem, Type::I32);
+      ur->ops = {end, mod.constInt((int32_t)kPartialFactor)};
+      Instruction *lr = emitPre(Op::SRem, Type::I32);
+      lr->ops = {lb, mod.constInt((int32_t)kPartialFactor)};
       Instruction *dd = emitPre(Op::Sub, Type::I32);
-      dd->ops = {ub, lb};
+      dd->ops = {ur, lr};
+      Instruction *positive = emitPre(Op::Add, Type::I32);
+      positive->ops = {dd, mod.constInt(2 * (int32_t)kPartialFactor)};
       Instruction *rr = emitPre(Op::SRem, Type::I32);
-      rr->ops = {dd, mod.constInt((int32_t)kPartialFactor)};
-      Instruction *aa = emitPre(Op::Sub, Type::I32);
-      aa->ops = {dd, rr};
-      Instruction *um = emitPre(Op::Add, Type::I32);
-      um->ops = {lb, aa};
+      rr->ops = {positive, mod.constInt((int32_t)kPartialFactor)};
+      Instruction *um = emitPre(Op::Sub, Type::I32);
+      um->ops = {end, rr};
       ubMain = um;
+      // The remainder's upper bound must use the same clamp. Otherwise an
+      // empty main loop could reseed the IV below lb in its epilogue.
+      ub = end;
     }
 
     // Mutate the loop: step 4, new upper bound, optional epilogue target.
@@ -743,9 +756,12 @@ private:
     int64_t step = af->step;
     if (!lb || !ub || step <= 0) return false;
     if (lb->v >= ub->v) return false;
-    int64_t trips = (ub->v - lb->v + step - 1) / step;
+    int64_t distance = int64_t(ub->v) - lb->v;
+    int64_t trips = 1 + (distance - 1) / step;
 
     if (trips > 32) return false;
+    // The original i32 induction update must reach a representable exit.
+    if (step > (INT32_MAX - int64_t(lb->v)) / trips) return false;
 
     std::vector<Instruction *> bodyInstrs;
     if (!collectBody(af, &bodyInstrs)) return false;
@@ -768,6 +784,10 @@ private:
       emitUnrolledCopy(mod, instrs, bodyInstrs, ivSlot, ivConst, t * step,
                        gepK, firstGep);
     }
+    auto finalIV = std::make_unique<Instruction>(Op::Store, Type::Void);
+    finalIV->line = afOwner->line;
+    finalIV->ops = {mod.constInt(int32_t(lb->v + trips * step)), ivSlot};
+    instrs.push_back(std::move(finalIV));
     auto br = std::make_unique<Instruction>(Op::Br, Type::Void);
     br->cond = Cond::Eq;
     br->ops = {exitBB};

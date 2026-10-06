@@ -75,7 +75,6 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
     // no readers, and the peephole round immediately below is what deletes it.
     if (!std::getenv("SAKU_NO_ZEROFILL")) zerofill = opt_.zeroFill(fns);
     if (!std::getenv("SAKU_NO_PEEPHOLE")) peephole = opt_.peephole(fns);
-    if (!std::getenv("SAKU_NO_SCHED")) scheduled = opt_.schedule(fns);
     if (!std::getenv("SAKU_NO_BLOCKCSE")) blockcse = opt_.blockLocalCse(fns);
     if (!std::getenv("SAKU_NO_MLICM")) hoisted = opt_.licm(fns);
     // LICM just pulled one `li`/`la` per inlined loop body into the shared
@@ -84,6 +83,10 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
     // folds the copies that ended up in different blocks.
     if (!std::getenv("SAKU_NO_GLOBALCSE")) globalcse = opt_.globalCse(fns);
     if (!std::getenv("SAKU_NO_BLOCKCSE2")) blockcse2 = opt_.blockLocalCse(fns);
+    // Schedule after LICM/CSE have settled live ranges, so its pressure check
+    // sees loop invariants in their final positions rather than undercounting
+    // the values that the later hoist will keep live throughout the loop.
+    if (!std::getenv("SAKU_NO_SCHED")) scheduled = opt_.schedule(fns);
     // Fold register copies (ISel's phi/latch copies in particular) once LICM
     // has settled the loop-invariant parts and before colouring decides the
     // registers, so coalescing at the virtual-register level can retire them.
@@ -92,7 +95,7 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
   dumpMir("SAKU_MIR_POST_MACHOPT", fns);
 
   // ---- 3) register allocation (graph-colouring + spills) ---------------
-  ra_.allocate(fns);
+  ra_.allocate(fns, opts.stats);
   dumpMir("SAKU_MIR_POST_RA", fns);
 
   // ---- 4) second peephole after register allocation --------------------

@@ -20,7 +20,7 @@ namespace backend {
 // RegisterAllocator) and the module's global data into RISC-V assembly text.
 class AssemblyWriter {
 public:
-  // Emit the .text section for every function in `fns` followed by the .data
+  // Emit the .text section for every function in `fns` followed by .data/.bss
   // section for the module's globals.  `mod` is read for globals only; the
   // functions were already consumed by InstructionSelector.
   std::string write(ir::Module *mod, std::vector<MachineFunc> &fns);

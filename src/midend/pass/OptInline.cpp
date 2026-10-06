@@ -53,7 +53,11 @@ constexpr int kMaxCallerGrowthRare = 1400;
 
 class InlineGeneralPass final : public Pass {
 public:
-  const char *name() const override { return "inline-general"; }
+  explicit InlineGeneralPass(bool specializeConstants)
+      : specializeConstants_(specializeConstants) {}
+  const char *name() const override {
+    return specializeConstants_ ? "inline-constants" : "inline-general";
+  }
   Layer inLayer() const override { return Layer::Cf; }
 
   bool run(Module &mod) override {
@@ -76,6 +80,7 @@ public:
   }
 
 private:
+  bool specializeConstants_ = false;
   // Functions a callee can reach through zero or more calls (only flat cf
   // calls matter; region op bodies were refused above).  If the caller is
   // reachable from the callee the two sit on a call cycle: inlining the
@@ -187,7 +192,26 @@ private:
     // argument-specialisation win applies at every one of those sites.
     auto csIt = callSites_.find(callee);
     const int nSites = (csIt == callSites_.end()) ? 0 : csIt->second;
-    const bool rare = bigInline_ && nSites > 0 && nSites <= kRareCallSites;
+    int specializationTests = 0;
+    for (size_t i = 1; i < call->ops.size() && i <= callee->args.size(); ++i) {
+      if (!dynamic_cast<ConstantInt *>(call->ops[i])) continue;
+      Value *arg = callee->args[i - 1].get();
+      // A constant merely setting a trip count rarely removes the callee's
+      // loop, and inlining that body can make all its invariants live in the
+      // caller. Give the larger budget to constants that fold a dispatch
+      // chain, where several paths actually disappear after cloning.
+      for (auto &bb : callee->blocks)
+        for (auto &iu : bb->instrs)
+          if (iu->op == Op::ICmp && iu->ops.size() == 2 &&
+              (iu->cond == Cond::Eq || iu->cond == Cond::Ne) &&
+              ((iu->ops[0] == arg && dynamic_cast<ConstantInt *>(iu->ops[1])) ||
+               (iu->ops[1] == arg && dynamic_cast<ConstantInt *>(iu->ops[0]))))
+            ++specializationTests;
+    }
+    if (specializeConstants_ && specializationTests < 2) return false;
+    const bool rare = bigInline_ &&
+        ((nSites > 0 && nSites <= kRareCallSites) ||
+         (specializeConstants_ && specializationTests >= 2));
     const int calleeCap = rare ? kMaxCalleeInstrsRare : kMaxCalleeInstrs;
     const int callerCap = rare ? kMaxCallerGrowthRare : kMaxCallerGrowth;
     if (calleeCost(callee) > calleeCap) return false;
@@ -262,7 +286,8 @@ private:
 
   void doInline(Module &mod, Function &caller, BasicBlock *bb, size_t ci,
                 Function *callee) {
-    std::string suffix = "_inl" + std::to_string(nextFresh(caller));
+    std::string suffix = (specializeConstants_ ? "_cinl" : "_inl") +
+                         std::to_string(nextFresh(caller));
     Instruction *call = bb->instrs[ci].get();
     CloneCtx cx;
     cx.callArgs.assign(call->ops.begin() + 1, call->ops.end());
@@ -387,8 +412,8 @@ private:
 
 } // namespace
 
-std::unique_ptr<Pass> makeInlineGeneralPass() {
-  return std::make_unique<InlineGeneralPass>();
+std::unique_ptr<Pass> makeInlineGeneralPass(bool specializeConstants) {
+  return std::make_unique<InlineGeneralPass>(specializeConstants);
 }
 
 } // namespace ir

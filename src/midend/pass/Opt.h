@@ -59,6 +59,9 @@ std::unique_ptr<Pass> makeLoopRotatePass(Layer l);
 std::unique_ptr<Pass> makeLicmPass(Layer l);
 std::unique_ptr<Pass> makeLoopUnrollPass(Layer l);
 std::unique_ptr<Pass> makeMatmulIkjPass(Layer l);
+std::unique_ptr<Pass> makePolyhedralPass();
+std::unique_ptr<Pass> makeLoopSplitPass();
+std::unique_ptr<Pass> makeBlockLayoutPass();
 std::unique_ptr<Pass> makeCfgSimplifyPass();
 std::unique_ptr<Pass> makeTailRecElimPass();
 std::unique_ptr<Pass> makeInlineSmallPass();
@@ -68,7 +71,7 @@ std::unique_ptr<Pass> makeNormalizeCmpPass(Layer l);
 std::unique_ptr<Pass> makeReassocPass(Layer l);
 std::unique_ptr<Pass> makeAddChainPass(Layer l);
 std::unique_ptr<Pass> makeRedundantStorePass(Layer l);
-std::unique_ptr<Pass> makeInlineGeneralPass();
+std::unique_ptr<Pass> makeInlineGeneralPass(bool specializeConstants = false);
 
 } // namespace ir
 } // namespace sakura

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <vector>
+#include <iosfwd>
 
 #include "Machine.h"
 
@@ -23,7 +24,7 @@ class RegisterAllocator {
 public:
   // Allocate `fns` in place; also fills each function's usedCSX/usedCSF and
   // hasCall fields consumed by the AssemblyWriter.
-  void allocate(std::vector<MachineFunc> &fns);
+  void allocate(std::vector<MachineFunc> &fns, std::ostream *stats = nullptr);
 };
 
 } // namespace backend

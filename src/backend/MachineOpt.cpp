@@ -279,23 +279,66 @@ bool isHoistableLoad(MOp op) {
 // can `load` (at index `j`) move one position up past `prev` (at j-1)?
 bool canPass(const MInst &load, const MInst &prev) {
   if (isBarrier(prev.op)) return false;
-  if (isHoistableLoad(prev.op)) return true; // reads commute
+  // Keep loads in order: moving a later load above a whole run of earlier
+  // loads lengthens all their live ranges without hiding any extra latency.
+  if (isHoistableLoad(prev.op)) return false;
   OpSlots ps = slots(prev);
-  // must not pass the definition of its own address register
-  return ps.def < 0 || ps.def != load.a;
+  // Machine IR is no longer SSA (phi copies can redefine a vreg).  Check
+  // RAW, WAW and WAR, including a read of the load destination by `prev`.
+  if (ps.def >= 0 && (ps.def == load.a || ps.def == load.dst)) return false;
+  for (int r : ps.use)
+    if (r >= 0 && r == load.dst) return false;
+  return true;
 }
 
-size_t scheduleBlock(MBlock &blk) {
+static void transferLive(const MInst &m, std::vector<char> &live) {
+  OpSlots s = slots(m);
+  if (s.def >= 0) live[(size_t)s.def] = 0;
+  for (int r : s.use)
+    if (r >= 0) live[(size_t)r] = 1;
+  for (const MArg &a : m.args)
+    if (a.vreg >= 0) live[(size_t)a.vreg] = 1;
+}
+
+size_t scheduleBlock(MBlock &blk, const std::vector<char> &liveOut,
+                     const std::vector<char> &isFloat) {
   std::vector<MInst> &v = blk.instrs;
+  // A boundary holds the exact live set before that instruction. A legal
+  // adjacent swap changes only the boundary between the two instructions.
+  std::vector<std::vector<char>> boundary(v.size() + 1, liveOut);
+  for (size_t i = v.size(); i-- > 0;) {
+    boundary[i] = boundary[i + 1];
+    transferLive(v[i], boundary[i]);
+  }
+  auto pressure = [&](const std::vector<char> &live, bool fp) {
+    int count = 0;
+    for (size_t r = 0; r < live.size(); ++r)
+      count += live[r] && (isFloat[r] != 0) == fp;
+    return count;
+  };
   size_t moved = 0;
   for (size_t i = 1; i < v.size(); ++i) {
     if (!isHoistableLoad(v[i].op)) continue;
     size_t j = i;
-    while (j > 0 && canPass(v[j], v[j - 1])) {
+    // A short latency window is enough for an in-order target.  Unbounded
+    // hoisting used to keep an entire unrolled loop's loads live together.
+    constexpr size_t latencyWindow = 2;
+    while (j > 0 && i - j < latencyWindow && canPass(v[j], v[j - 1])) {
+      auto between = boundary[j + 1];
+      transferLive(v[j - 1], between);
+      bool increasesPeak = false;
+      for (bool fp : {false, true}) {
+        int oldPeak = std::max({pressure(boundary[j - 1], fp),
+                               pressure(boundary[j], fp),
+                               pressure(boundary[j + 1], fp)});
+        if (pressure(between, fp) > oldPeak) increasesPeak = true;
+      }
+      if (increasesPeak) break;
       std::swap(v[j], v[j - 1]);
+      boundary[j] = std::move(between);
       --j;
-      ++moved;
     }
+    moved += j != i;
   }
   return moved;
 }
@@ -721,7 +764,10 @@ static CfgEdges buildCfg(const MachineFunc &f) {
   for (int i = 0; i < n; ++i) labelMap[f.blocks[(size_t)i].name] = i;
   for (int i = 0; i < n; ++i) {
     const std::vector<MInst> &v = f.blocks[(size_t)i].instrs;
-    if (v.empty()) continue;
+    if (v.empty()) {
+      if (i + 1 < n) e.succ[(size_t)i].push_back(i + 1);
+      continue;
+    }
     // ISel may emit a conditional branch *followed by* an unconditional jump
     // at the end of a block, neither of whose targets is the layout
     // fall-through.  Every trailing branch contributes a successor, so scan
@@ -967,6 +1013,14 @@ static size_t licmMachineFn(MachineFunc &f) {
               f.blocks[(size_t)lp.header].name.c_str(),
               f.blocks[(size_t)pre].name.c_str());
 
+    bool loopHasCall = false;
+    for (int b = 0; b < n && !loopHasCall; ++b) {
+      if (!inLoop[(size_t)b]) continue;
+      for (const MInst &m : f.blocks[(size_t)b].instrs)
+        if (m.op == MOp::Call) { loopHasCall = true; break; }
+    }
+    if (!std::getenv("SAKU_OLD_LICM_SPLIT") && loopHasCall) continue;
+
     // ---- split inline global addressing into an explicit preheader `la` ----
     // A global scalar access is a single `LwG sym` / `SwG sym` with the symbol
     // baked in, so the writer has to materialise `la t0, sym` afresh at every
@@ -1181,15 +1235,10 @@ DivMagic magicFor(int64_t d) {
 //
 //     q = (x * M) >> (32 + s)
 //
-// On RV64 `mulhu` is the high half of the full *64x64* product, not of a 32x32
-// one, so the operands are pre-scaled by 2^32 exactly the way LLVM's RISC-V
-// backend does it: `mulhu(x << 32, M << 32)` is x*M (the low 32 bits of each
-// factor never contribute to the high 64), and a 64-bit `srli` finishes it.
-// That is 3 instructions where the signed sequence needs 6 - no arithmetic
-// shift and no sign correction, both of which are provably zero for a
-// non-negative dividend (which is what ISel's range analysis exports in
-// MachineFunc::nonNeg).  The pre-shifted magic is loop-invariant, so LICM and
-// the global CSE hoist it out of the loop.
+// Here x is a signed i32 proven non-negative, rather than an arbitrary u32.
+// Its 32x32 product with M fits signed i64, so RV64 `mul` followed by `srli`
+// suffices. There is no arithmetic shift or sign correction. LICM/CSE can
+// hoist the magic materialization out of the loop.
 struct UMagic {
   uint32_t M = 0;
   int s = 0;
@@ -1260,7 +1309,7 @@ public:
   int64_t andMask = 0;
   // The dividend x is known to be in [0, 2^31) (ISel's range analysis).  A
   // constant division is then an *unsigned* division and can use the much
-  // shorter `mulhu` magic sequence instead of the signed one.
+  // shorter multiply/shift magic sequence instead of the signed one.
   bool xNonNeg = false;
   std::vector<MInst> seq;
 
@@ -1396,16 +1445,15 @@ int32_t magicQuot(SrCtx &c, int32_t x, int64_t m) {
   return magicQuotTo(c, x, m);
 }
 
-// x * M, where `mhi` holds the 32-bit magic pre-shifted into the high half of
-// a 64-bit register (M << 32) and `x` is the non-negative dividend.  Doing the
-// same shift on both factors keeps every significant bit inside the high 64
-// bits of the 128-bit product, which is exactly what `mulhu` returns - the
-// RISC-V spelling of "mulhi_epu64".  This is the operand pair LLVM's RISC-V
-// backend builds for an i32 udiv; on an RV32 target the shift is unnecessary.
+// Complete product x * M for a non-negative signed i32 dividend. The caller
+// extracts the high 32 bits (and any extra magic shift) from this i64 result.
 int32_t unsignedMulHi(SrCtx &sr, int32_t x, uint32_t M) {
-  int32_t mreg = sr.liWide((int64_t)((uint64_t)M << 32));
-  int32_t t1 = sr.uop(MOp::Shl64I, x, 32);
-  return sr.bop(MOp::Mulhu, t1, mreg);
+  // This path is only used for signed i32 values proven non-negative, so
+  // x <= INT32_MAX and M <= UINT32_MAX. Their product fits signed i64.
+  // A plain RV64 multiply therefore yields the same complete 32x32 product
+  // as mulhu(x << 32, M << 32), without the shift or a multiply-high.
+  int32_t mreg = sr.liWide((int64_t)M);
+  return sr.bop(MOp::Mul64, x, mreg);
 }
 
 // floor(x / d) for x *known non-negative*, with the result left in a fresh
@@ -1539,7 +1587,7 @@ bool buildRewrite(SrCtx &sr, MOp op, int32_t x, int64_t cst) {
     // non-power-of-two |c| >= 3 (works for even divisors too, verified)
     if (cc > 0) {
       // A known non-negative dividend makes this an unsigned division, which
-      // the `mulhu` magic computes in two instructions instead of the six the
+      // the unsigned magic computes in two instructions instead of the six the
       // signed sequence spends (see magicu).  Divisors needing the average
       // variant keep the signed path, which is never longer.
       if (sr.xNonNeg && haveUnsignedQuot((uint32_t)absC)) {
@@ -1627,7 +1675,7 @@ bool buildRewrite(SrCtx &sr, MOp op, int32_t x, int64_t cst) {
       return true;
     }
     // magic: q = trunc(x / |c|), then rem = x - q*|c|.  When x is known
-    // non-negative the quotient comes from the two-instruction `mulhu`
+    // non-negative the quotient comes from the two-instruction multiply/shift
     // sequence instead of the signed one (see magicu).
     int32_t q;
     if (sr.xNonNeg && haveUnsignedQuot((uint32_t)absC))
@@ -1698,7 +1746,7 @@ size_t strengthReduceFn(MachineFunc &f) {
       } else if (m.op == MOp::ISltuZ) { // dst = (0 <u a) == (a != 0)
         isZeroTest = true;
         tested = m.a;
-      } else if (m.op == MOp::BrCmp && m.b < 0 &&
+      } else if ((m.op == MOp::BrCmp || m.op == MOp::ICmp) && m.b < 0 &&
                  (m.imm == (int)Cond::Eq || m.imm == (int)Cond::Ne)) {
         // ISel folds `cmpi eq/ne x, 0` into a direct branch against the zero
         // register, leaving the compare-to-zero implicit in `b == -1`.
@@ -1735,8 +1783,11 @@ size_t strengthReduceFn(MachineFunc &f) {
       // precisely because that cheaper compare spelling was chosen.
       if (m.b == -1) {
         auto ud = m.a >= 0 ? uniqDef.find(m.a) : uniqDef.end();
+        // The xor's numeric result changes for negative dividends. Looking
+        // through it is legal only when *all* its uses observe zero-ness;
+        // an additional arithmetic/store use must retain the true remainder.
         if (ud != uniqDef.end() && ud->second->op == MOp::IXorI &&
-            ud->second->a >= 0)
+            ud->second->a >= 0 && zeroOnly.count(m.a))
           cmpConsts[ud->second->a].push_back((int64_t)ud->second->imm);
         continue;
       }
@@ -1776,7 +1827,7 @@ size_t strengthReduceFn(MachineFunc &f) {
   int nextReg = 0;
   // A/B switch for the `% 2^k == c` bit-test fold (see the IRem case).
   static const bool noBitTest = std::getenv("SAKU_NO_BITTEST") != nullptr;
-  // A/B switch for the `mulhu` unsigned-magic division of a known
+  // A/B switch for unsigned-magic division of a known
   // non-negative dividend (see magicu / the IDiv case).
   static const bool noUnsignedDiv = std::getenv("SAKU_NO_UDIV") != nullptr;
   auto upd = [&](int32_t r) {
@@ -1919,8 +1970,15 @@ static size_t coalesceMovesFn(MachineFunc &f) {
 
         for (size_t j = i; j-- > 0;) {
           MInst &p = v[j];
-          // control flow / calls end the straight-line window
-          if (p.op == MOp::Call || p.op == MOp::Ret || p.op == MOp::Jmp ||
+          // Control flow ends the straight-line window.  A call does *not*:
+          // the rewrite is purely a virtual-register renaming (`s`'s only
+          // reader is the copy, so retargeting the defining instruction at `d`
+          // cannot strand a reader), and the redefinition / read-of-`d` checks
+          // below still see every call argument through usesOf().  Bailing at
+          // a call costs a register per loop-carried value updated before the
+          // call, exactly the values a loop body containing a call already has
+          // to keep in a callee-saved register.
+          if (p.op == MOp::Ret || p.op == MOp::Jmp ||
               p.op == MOp::BrNz || p.op == MOp::BrZ || p.op == MOp::BrCmp ||
               p.op == MOp::Prologue)
             break;
@@ -2199,8 +2257,47 @@ size_t MachineOptimizer::peephole(std::vector<MachineFunc> &fns) {
 
 size_t MachineOptimizer::schedule(std::vector<MachineFunc> &fns) {
   size_t s = 0;
-  for (MachineFunc &f : fns)
-    for (MBlock &blk : f.blocks) s += scheduleBlock(blk);
+  for (MachineFunc &f : fns) {
+    int nreg = 0;
+    for (const auto &b : f.blocks)
+      for (const auto &m : b.instrs) {
+        OpSlots sl = slots(m);
+        nreg = std::max(nreg, sl.def + 1);
+        for (int r : sl.use) nreg = std::max(nreg, r + 1);
+        for (const auto &a : m.args) nreg = std::max(nreg, a.vreg + 1);
+      }
+    std::vector<char> isFloat((size_t)nreg, 0);
+    for (const auto &b : f.blocks)
+      for (const auto &m : b.instrs) {
+        OpSlots sl = slots(m);
+        if (sl.def >= 0) isFloat[(size_t)sl.def] = sl.defFile == RF_F;
+        for (int i = 0; i < 3; ++i)
+          if (sl.use[i] >= 0) isFloat[(size_t)sl.use[i]] = sl.useFile[i] == RF_F;
+        for (const auto &a : m.args)
+          if (a.vreg >= 0) isFloat[(size_t)a.vreg] = a.ty == Type::F32;
+      }
+    const CfgEdges cfg = buildCfg(f);
+    std::vector<std::vector<char>> in(f.blocks.size(), std::vector<char>((size_t)nreg, 0));
+    auto out = in;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (size_t bi = f.blocks.size(); bi-- > 0;) {
+        std::vector<char> live((size_t)nreg, 0);
+        for (int successor : cfg.succ[bi])
+          for (int r = 0; r < nreg; ++r) live[(size_t)r] |= in[(size_t)successor][(size_t)r];
+        out[bi] = live;
+        const auto &code = f.blocks[bi].instrs;
+        for (size_t i = code.size(); i-- > 0;) transferLive(code[i], live);
+        if (live != in[bi]) {
+          in[bi] = std::move(live);
+          changed = true;
+        }
+      }
+    }
+    for (size_t bi = 0; bi < f.blocks.size(); ++bi)
+      s += scheduleBlock(f.blocks[bi], out[bi], isFloat);
+  }
   return s;
 }
 

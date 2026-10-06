@@ -12,7 +12,8 @@ CLANG=${CLANG:-clang-18}
 tmp=$(mktemp /tmp/llvmref_XXXXXX.cpp)
 cat "$ROOT/scripts/sysy_prelude.h" "$src" > "$tmp"
 "$CLANG" --target=riscv64-unknown-linux-gnu -march=rv64gc -mabi=lp64d \
-  -O3 -fno-builtin -fno-slp-vectorize -fno-addrsig -S -o "$out" -x c++ "$tmp" "$@"
+  -O3 -fno-builtin -fno-slp-vectorize -fno-addrsig -ffp-contract=off \
+  -S -o "$out" -x c++ "$tmp" "$@"
 rc=$?
 rm -f "$tmp"
 exit $rc

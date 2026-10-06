@@ -22,10 +22,11 @@
 // depending on the multiply's latency, which matters most in the strided
 // matrix / array kernels this pass targets.
 //
-// The pass is deliberately narrow: it only rewrites single-latch natural loops
+// The pass rewrites natural loops whose backedges all advance the induction
+// variable by the same step (including loops with continue statements),
 // whose header carries the induction `cf.phi` (the shape mem2reg leaves
 // behind), and only offsets that are affine in *one* induction variable with a
-// constant coefficient.  Everything else in the offset must be loop-invariant,
+// loop-invariant coefficient. Everything else must also be loop-invariant,
 // which is checked transitively; an invariant sub-expression that lives inside
 // the loop is cloned into the preheader so the new pointer's initial value can
 // be computed there.  Every use of an address must be inside the loop, so the
@@ -89,6 +90,10 @@ struct Rewriter {
   Value *invAdd(Value *a, Value *b, size_t blockIdx);
   Value *invSub(Value *a, Value *b, size_t blockIdx);
   Value *invMulC(Value *a, int64_t c, size_t blockIdx);
+  Value *invMul(Value *a, Value *b, size_t blockIdx);
+  Value *withConstant(Value *a, int64_t c, size_t bi) {
+    return c == 0 ? a : invAdd(a, mod.constInt((int32_t)c), bi);
+  }
 
   // A value usable from the preheader that is equal to `v` on every iteration
   // of the loop.  Values defined outside the loop are used as they are; an
@@ -132,9 +137,10 @@ struct Rewriter {
     return cp;
   }
 
-  // offset = k * iv + c + inv   (inv an i32 value available in the preheader)
+  // offset = (k + dynK) * iv + c + inv (all invariant values are i32).
   struct Aff {
     int64_t k = 0;
+    Value *dynK = nullptr;
     int64_t c = 0;
     Value *inv = nullptr;
     bool bad = false; // integral coefficient did not fit an i32
@@ -149,6 +155,7 @@ struct Rewriter {
     r.k = (int64_t)k;
     r.c = (int64_t)c;
     r.inv = invAdd(a.inv, b.inv, bi);
+    r.dynK = invAdd(a.dynK, b.dynK, bi);
     return r;
   }
 
@@ -161,6 +168,7 @@ struct Rewriter {
     r.k = (int64_t)k;
     r.c = (int64_t)c;
     r.inv = invSub(a.inv, b.inv, bi);
+    r.dynK = invSub(a.dynK, b.dynK, bi);
     return r;
   }
 
@@ -173,6 +181,7 @@ struct Rewriter {
     r.k = (int64_t)k;
     r.c = (int64_t)cc;
     r.inv = invMulC(a.inv, c, bi);
+    r.dynK = invMulC(a.dynK, c, bi);
     r.bad = r.bad || a.bad;
     return r;
   }
@@ -187,12 +196,14 @@ struct Rewriter {
       out.c = ci->v;
       return true;
     }
-    if (Value *p = preOf(v, bi, 0)) {
-      out.inv = p;
-      return true;
-    }
     auto *in = dynamic_cast<Instruction *>(v);
-    if (!in || in->ops.size() != 2) return false;
+    // Decompose invariant arithmetic too: (i-1)*row + j*col and
+    // i*row + j*col differ by a constant displacement, not by a new base.
+    if (!in || in->ops.size() != 2 ||
+        (in->op != Op::Add && in->op != Op::Sub && in->op != Op::Mul)) {
+      if (Value *p = preOf(v, bi, 0)) { out.inv = p; return true; }
+      return false;
+    }
     Aff a, b;
     if (!affine(in->ops[0], iv, a, bi, depth + 1)) return false;
     if (!affine(in->ops[1], iv, b, bi, depth + 1)) return false;
@@ -204,14 +215,24 @@ struct Rewriter {
       out = affSub(a, b, bi);
       return true;
     case Op::Mul:
-      // One factor must be a bare constant; the other carries the induction
-      // variable (or is invariant).  `(iv*a)*(iv*b)` is quadratic: rejected.
-      if (a.k == 0 && !a.inv && !a.bad) {
+      // `(iv*a)*(iv*b)` is quadratic and cannot become a pointer recurrence.
+      if (a.k == 0 && !a.dynK && !a.inv && !a.bad) {
         out = affMulC(b, a.c, bi);
         return true;
       }
-      if (b.k == 0 && !b.inv && !b.bad) {
+      if (b.k == 0 && !b.dynK && !b.inv && !b.bad) {
         out = affMulC(a, b.c, bi);
+        return true;
+      }
+      // A runtime row stride is invariant too. Carry its byte increment
+      // around the loop instead of multiplying the IV in every iteration.
+      if (!a.bad && !b.bad &&
+          ((a.k == 0 && !a.dynK) || (b.k == 0 && !b.dynK))) {
+        const Aff &linear = (a.k == 0 && !a.dynK) ? b : a;
+        const Aff &invariant = (a.k == 0 && !a.dynK) ? a : b;
+        Value *factor = withConstant(invariant.inv, invariant.c, bi);
+        out.dynK = invMul(withConstant(linear.dynK, linear.k, bi), factor, bi);
+        out.inv = invMul(withConstant(linear.inv, linear.c, bi), factor, bi);
         return true;
       }
       return false;
@@ -252,7 +273,7 @@ Value *Rewriter::invSub(Value *a, Value *b, size_t blockIdx) {
 }
 
 Value *Rewriter::invMulC(Value *a, int64_t c, size_t blockIdx) {
-  if (!a) return nullptr;
+  if (!a || c == 0) return nullptr;
   if (c == 1) return a;
   char key[64];
   snprintf(key, sizeof key, "m%p|%lld", (void *)a, (long long)c);
@@ -260,6 +281,22 @@ Value *Rewriter::invMulC(Value *a, int64_t c, size_t blockIdx) {
   if (it != invMemo.end()) return it->second;
   auto u = std::make_unique<Instruction>(Op::Mul, Type::I32);
   u->ops = {a, mod.constInt((int32_t)c)};
+  Value *r = u.get();
+  insertPre(std::move(u), blockIdx);
+  invMemo[key] = r;
+  return r;
+}
+
+Value *Rewriter::invMul(Value *a, Value *b, size_t blockIdx) {
+  if (!a || !b) return nullptr;
+  if (auto *c = asConstInt(a)) return invMulC(b, c->v, blockIdx);
+  if (auto *c = asConstInt(b)) return invMulC(a, c->v, blockIdx);
+  char key[64];
+  snprintf(key, sizeof key, "v%p|%p", (void *)a, (void *)b);
+  auto it = invMemo.find(key);
+  if (it != invMemo.end()) return it->second;
+  auto u = std::make_unique<Instruction>(Op::Mul, Type::I32);
+  u->ops = {a, b};
   Value *r = u.get();
   insertPre(std::move(u), blockIdx);
   invMemo[key] = r;
@@ -304,7 +341,8 @@ private:
   struct IV {
     Instruction *phi = nullptr;
     Value *init = nullptr; // value on the preheader edge
-    size_t header = 0, latch = 0, pre = 0;
+    size_t header = 0, pre = 0;
+    std::vector<size_t> latches;
     int64_t step = 0;
   };
 
@@ -312,6 +350,7 @@ private:
     Instruction *gep = nullptr;
     Value *base = nullptr;
     int64_t k = 0;
+    Value *dynK = nullptr;
     Value *inv = nullptr;
     // Constant part of the offset, kept *out* of `inv` on purpose.  The
     // pointer phi is built for `base + k*iv + inv`; a candidate whose offset
@@ -385,17 +424,16 @@ private:
       for (size_t b = 0; b < n; ++b)
         for (size_t s : succ[b])
           if (s == hh && dom[b][hh]) latches.push_back(b);
-      // A single latch keeps the header phis' in-loop edge unambiguous.
-      if (latches.size() != 1) continue;
-      size_t latch = latches[0];
-      if (latch == hh) continue;
+      std::sort(latches.begin(), latches.end());
+      latches.erase(std::unique(latches.begin(), latches.end()), latches.end());
+      if (latches.empty() || std::find(latches.begin(), latches.end(), hh) != latches.end()) continue;
 
       // Natural-loop node set: everything reaching the latch without passing
       // through the header, plus the header itself.
       std::vector<uint8_t> inLoop(n, 0);
       inLoop[hh] = 1;
-      inLoop[latch] = 1;
-      std::vector<size_t> work{latch};
+      for (size_t latch : latches) inLoop[latch] = 1;
+      std::vector<size_t> work = latches;
       while (!work.empty()) {
         size_t x = work.back();
         work.pop_back();
@@ -419,7 +457,7 @@ private:
         Instruction *phi = iu.get();
         if (phi->op != Op::Phi) continue;
         Value *init = nullptr;
-        Value *nxt = nullptr;
+        std::vector<Value *> nextValues;
         for (size_t k = 0; k + 1 < phi->ops.size(); k += 2) {
           auto *pb = dynamic_cast<BasicBlock *>(phi->ops[k]);
           if (!pb) continue;
@@ -427,32 +465,40 @@ private:
           if (it == idx.end()) continue;
           if (it->second == ph)
             init = phi->ops[k + 1];
-          else if (it->second == latch)
-            nxt = phi->ops[k + 1];
+          else if (std::find(latches.begin(), latches.end(), it->second) != latches.end())
+            nextValues.push_back(phi->ops[k + 1]);
         }
-        if (!init || !nxt || init == phi) continue;
-        auto *nx = dynamic_cast<Instruction *>(nxt);
-        if (!nx || nx->ops.size() != 2) continue;
+        if (!init || nextValues.size() != latches.size() || init == phi) continue;
         int64_t step = 0;
-        bool ok = false;
-        if (nx->op == Op::Add || nx->op == Op::Sub) {
-          const ConstantInt *ca = asConstInt(nx->ops[0]);
-          const ConstantInt *cb = asConstInt(nx->ops[1]);
-          // `step` is the *signed* increment: `subi iv, c` walks backwards.
-          if (nx->ops[0] == (Value *)phi && cb) {
-            step = nx->op == Op::Sub ? -cb->v : cb->v;
-            ok = true;
-          } else if (nx->op == Op::Add && nx->ops[1] == (Value *)phi && ca) {
-            step = ca->v;
-            ok = true;
+        bool ok = true;
+        for (Value *nxt : nextValues) {
+          auto *nx = dynamic_cast<Instruction *>(nxt);
+          if (!nx || nx->ops.size() != 2) { ok = false; break; }
+          int64_t nextStep = 0;
+          bool matches = false;
+          if (nx->op == Op::Add || nx->op == Op::Sub) {
+            const ConstantInt *ca = asConstInt(nx->ops[0]);
+            const ConstantInt *cb = asConstInt(nx->ops[1]);
+            // `step` is signed: `subi iv, c` walks backwards.
+            if (nx->ops[0] == (Value *)phi && cb) {
+              nextStep = nx->op == Op::Sub ? -int64_t(cb->v) : cb->v;
+              matches = true;
+            } else if (nx->op == Op::Add && nx->ops[1] == (Value *)phi && ca) {
+              nextStep = ca->v;
+              matches = true;
+            }
           }
+          if (!matches || nextStep == 0 || (step != 0 && step != nextStep)) {
+            ok = false; break;
+          }
+          step = nextStep;
         }
         if (!ok || step == 0) continue;
         IV iv;
         iv.phi = phi;
         iv.init = init;
         iv.header = hh;
-        iv.latch = latch;
+        iv.latches = latches;
         iv.pre = ph;
         iv.step = step;
         ivs.push_back(iv);
@@ -474,7 +520,7 @@ private:
           for (const IV &iv : ivs) {
             Rewriter::Aff aff;
             if (!rw.affine(ins->ops[1], iv.phi, aff, ph, 0)) continue;
-            if (aff.bad || aff.k == 0) continue;
+            if (aff.bad || (aff.k == 0 && !aff.dynK)) continue;
             int64_t delta = 0;
             if (!mulFits(aff.k, iv.step, delta)) continue;
             // The base has to be available (and unchanged) in the preheader.
@@ -499,6 +545,7 @@ private:
             cd.gep = ins;
             cd.base = ins->ops[0];
             cd.k = aff.k;
+            cd.dynK = aff.dynK;
             cd.inv = aff.inv;
             cd.c = aff.c;
             cd.iv = &iv;
@@ -522,8 +569,8 @@ private:
       std::vector<std::vector<const Cand *>> groups;
       for (const Cand &cd : cands) {
         char key[128];
-        snprintf(key, sizeof key, "%p|%p|%lld|%p", (void *)cd.iv->phi,
-                 (void *)cd.base, (long long)cd.k, (void *)cd.inv);
+        snprintf(key, sizeof key, "%p|%p|%lld|%p|%p", (void *)cd.iv->phi,
+                 (void *)cd.base, (long long)cd.k, (void *)cd.dynK, (void *)cd.inv);
         auto git = gidx.find(key);
         if (git != gidx.end()) {
           groups[git->second].push_back(&cd);
@@ -532,6 +579,23 @@ private:
           groups.push_back({&cd});
         }
       }
+      // Widely separated rows cannot share a RISC-V load/store displacement.
+      // Cluster offsets before applying the register budget; neighbouring
+      // stencil accesses share a pointer instead of consuming one per load.
+      std::vector<std::vector<const Cand *>> clusters;
+      for (auto &g : groups) {
+        std::sort(g.begin(), g.end(), [](const Cand *a, const Cand *b) { return a->c < b->c; });
+        for (const Cand *cd : g) {
+          if (clusters.empty() || clusters.back()[0]->iv != cd->iv ||
+              clusters.back()[0]->base != cd->base || clusters.back()[0]->k != cd->k ||
+              clusters.back()[0]->dynK != cd->dynK || clusters.back()[0]->inv != cd->inv ||
+              cd->c - clusters.back()[0]->c > 4095)
+            clusters.push_back({cd});
+          else
+            clusters.back().push_back(cd);
+        }
+      }
+      groups = std::move(clusters);
       if (groups.size() > kMaxPerLoop) continue;
 
       for (const std::vector<const Cand *> &g : groups) {
@@ -555,10 +619,9 @@ private:
             lo = std::min(lo, cd->c);
             hi = std::max(hi, cd->c);
           }
-          // Folding the smallest constant makes the first lane displacement-
-          // free; only do it when the others stay encodable (and when the
-          // group is all-nonnegative, so no lane's displacement grows).
-          if (lo >= 0 && hi - lo <= 2047) c0 = lo;
+          // A cluster spans at most 4095 bytes. Choose an anchor that makes
+          // every remaining displacement fit the signed 12-bit encoding.
+          c0 = hi - lo <= 2047 ? lo : lo + 2048;
         }
         Instruction *p = buildPointer(rw, mod, f, *g[0], c0);
         if (!p) continue;
@@ -602,17 +665,20 @@ private:
 
     BasicBlock *preB = f.blocks[iv.pre].get();
     BasicBlock *headB = f.blocks[iv.header].get();
-    BasicBlock *latchB = f.blocks[iv.latch].get();
 
     // preheader: the offset against the loop's initial induction value, plus
     // the invariant part (already materialised in the preheader by preOf).
     std::vector<std::unique_ptr<Instruction>> preOps;
     Value *off = nullptr;
-    if (cd.k == 1) {
+    Value *stride = rw.withConstant(cd.dynK, cd.k, iv.pre);
+    Value *increment = cd.dynK
+        ? rw.invMulC(stride, iv.step, iv.pre)
+        : mod.constInt((int32_t)delta);
+    if (!cd.dynK && cd.k == 1) {
       off = iv.init;
     } else {
       auto mu = std::make_unique<Instruction>(Op::Mul, Type::I32);
-      mu->ops = {iv.init, mod.constInt((int32_t)cd.k)};
+      mu->ops = {iv.init, stride};
       off = mu.get();
       preOps.push_back(std::move(mu));
     }
@@ -637,11 +703,6 @@ private:
     auto pphi = std::make_unique<Instruction>(Op::Phi, Type::Ptr);
     Instruction *p = pphi.get();
 
-    // latch: the per-iteration increment
-    auto pnext = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
-    pnext->ops = {p, mod.constInt((int32_t)delta)};
-    Instruction *pNext = pnext.get();
-
     // splice the preheader ops in before its terminator
     auto &pv = preB->instrs;
     size_t at = pv.empty() ? 0 : pv.size() - 1;
@@ -658,12 +719,18 @@ private:
     hv.insert(hv.begin() + (long)hAt, std::move(pphi));
     rw.blockOf[p] = iv.header;
 
-    p->ops = {(Value *)preB, pInit, (Value *)latchB, pNext};
-
-    auto &lv = latchB->instrs;
-    size_t lAt = lv.empty() ? 0 : lv.size() - 1;
-    lv.insert(lv.begin() + (long)lAt, std::move(pnext));
-    rw.blockOf[pNext] = iv.latch;
+    p->ops = {(Value *)preB, pInit};
+    for (size_t latch : iv.latches) {
+      BasicBlock *latchB = f.blocks[latch].get();
+      auto pnext = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
+      pnext->ops = {p, increment};
+      Instruction *pNext = pnext.get();
+      p->ops.insert(p->ops.end(), {(Value *)latchB, pNext});
+      auto &lv = latchB->instrs;
+      size_t lAt = lv.empty() ? 0 : lv.size() - 1;
+      lv.insert(lv.begin() + (long)lAt, std::move(pnext));
+      rw.blockOf[pNext] = latch;
+    }
 
     return p;
   }

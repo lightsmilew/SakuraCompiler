@@ -34,6 +34,15 @@ the reference `libsysy_riscv.a`):
 | `cases/performance2026`|   60 | 100% passing  |
 | `cases/tensor`        |    25 | 100% passing (TensorType extension) |
 
+The [performance2026 register-pressure analysis](docs/performance2026-register-pressure.md)
+documents LLVM comparisons, spill diagnostics and repeatable timing with
+`tools/benchmark.py` on an already running VM.
+
+The [LLVM follow-up analysis](docs/performance2026-llvm-followup.md) covers
+constant-argument dispatch specialization, comparison-branch fusion, cheaper
+non-negative division, and regression fixes for remainder tests, range guards
+promoted-phi lifetime, and conditional phi-edge copies.
+
 ---
 
 ## 1. Quick start
@@ -313,6 +322,11 @@ assembly did not change are reported `CACHED` and skip the guest entirely.
   instruction selection).
 
 ## 8. Directory layout
+
+`-O2` also includes dependence-checked affine loop interchange/tiling and
+static CFG block placement. See [polyhedral and layout notes](docs/polyhedral-layout.md)
+and [index-set loop splitting](docs/loop-split.md) for supported domains, legality
+constraints, references, regression tests and A/B switches.
 
 ```
 CMakeLists.txt                    build definition (ANTLR4 vendored as a subdir)

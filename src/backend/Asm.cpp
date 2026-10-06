@@ -652,25 +652,22 @@ void emitFunction(std::ostringstream &os, const MachineFunc &mf) {
 }
 
 // ---------------------------------------------------------------------------
-// globals -> .data
+// globals -> .bss for zero bytes, .data for nonzero initializers
 // ---------------------------------------------------------------------------
 void emitGlobal(std::ostringstream &os, const GlobalVar &g) {
-  os << "\n\t.data\n\t.p2align 2\n\t.globl " << g.name << "\n";
-  os << g.name << ":\n";
   bool isF = g.elem == Type::F32;
   int64_t n = g.elems;
   int64_t bytes = n * 4;
-  if (!g.hasInit) {
-    os << "\t.zero " << bytes << "\n";
-    return;
-  }
   bool allZero = true;
   for (auto &c : g.init) {
-    if (isF ? (c.fval != 0.0f) : (c.ival != 0)) {
+    // -0.0 compares equal to +0.0 but has different observable bits.
+    if (isF ? (c.fbits() != 0) : (c.ival != 0)) {
       allZero = false;
       break;
     }
   }
+  os << (allZero ? "\n\t.bss\n" : "\n\t.data\n")
+     << "\t.p2align 2\n\t.globl " << g.name << "\n" << g.name << ":\n";
   if (allZero) {
     os << "\t.zero " << bytes << "\n";
     return;

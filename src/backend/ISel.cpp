@@ -35,6 +35,16 @@ Cond invertCond(Cond c) {
   }
 }
 
+Cond swapCond(Cond c) {
+  switch (c) {
+  case Cond::Lt: return Cond::Gt;
+  case Cond::Le: return Cond::Ge;
+  case Cond::Gt: return Cond::Lt;
+  case Cond::Ge: return Cond::Le;
+  default: return c;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Address expression: one of
 //   0 = frame slot   (off = local byte offset from locals area)
@@ -227,7 +237,7 @@ private:
         // what the induction rule uses to rule out a wrapping step.  Record the
         // relation for either operand.
         Cond p0 = c->cond;             // ops[0] <p0> ops[1]
-        Cond p1 = invertCond(c->cond); // ops[1] <p1> ops[0]
+        Cond p1 = swapCond(c->cond); // ops[1] <p1> ops[0]
         if (p0 == Cond::Lt || p0 == Cond::Gt)
           varGuards_[c->ops[0]].push_back({(int)k, tit->second, p0 == Cond::Lt});
         if (p1 == Cond::Lt || p1 == Cond::Gt)
@@ -247,7 +257,7 @@ private:
       } else {
         continue; // both constant (folded away)
       }
-      Cond pred = vLeft ? c->cond : invertCond(c->cond);
+      Cond pred = vLeft ? c->cond : swapCond(c->cond);
       bool upper;
       long long bound;
       switch (pred) {
@@ -572,6 +582,7 @@ public:
   // the end of every predecessor block.
   std::unordered_map<const BasicBlock *, std::vector<Instruction *>> blockPhis;
   std::unordered_map<const Value *, int32_t> phiRegs; // phi -> its vreg
+  std::vector<MBlock> phiEdges;
 
   int nextReg = 0;
   int nextFrameByte = 0;
@@ -1463,10 +1474,9 @@ void lowerTerminator(FnLower &L, BasicBlock *bb, size_t bi) {
   // cf.phi lowering: a successor block may need the value this block feeds
   // into each of its phis.  The copy lands at the end of *this* block, so on
   // a loop back edge it is exactly the "phi copy" a register-allocated loop
-  // counter needs.  Copies are emitted for every branch target; a copy whose
-  // destination is never reached on the taken path only writes a dead vreg
-  // (its phi block is only ever read through this or another predecessor's
-  // copy), so this is safe even without edge splitting.
+  // counter needs. A conditional edge must be split when a destination's old
+  // value is still used by the condition or the other successor. Otherwise
+  // its speculative copy would overwrite a live loop value on the wrong edge.
   //
   // The phis of one target execute SIMULTANEOUSLY (SSA merge semantics): when
   // they feed each other across the edge - the A=D;D=C;C=B;temp rotation of a
@@ -1625,17 +1635,96 @@ void lowerTerminator(FnLower &L, BasicBlock *bb, size_t bi) {
   Value *cond = t->ops[0];
   auto *thenB = dynamic_cast<BasicBlock *>(t->ops[1]);
   auto *elseB = dynamic_cast<BasicBlock *>(t->ops[2]);
-  // incoming phi values for both arms (see the note above: emitted before the
-  // conditional branch, which is safe without edge splitting)
-  emitPhiCopies(thenB);
-  if (elseB != thenB) emitPhiCopies(elseB);
-  std::string thenL = L.labelFor(thenB), elseL = L.labelFor(elseB);
-
   if (auto *ci = dynamic_cast<ConstantInt *>(cond)) {
-    jmp(ci->v ? thenB : elseB);
+    auto *target = ci->v ? thenB : elseB;
+    emitPhiCopies(target);
+    jmp(target);
+    return;
+  }
+  if (thenB == elseB) {
+    emitPhiCopies(thenB);
+    jmp(thenB);
     return;
   }
   int32_t cv = L.forceReg(cond, line);
+  auto needsEdge = [&](BasicBlock *target, BasicBlock *other) {
+    auto it = L.blockPhis.find(target);
+    if (it == L.blockPhis.end()) return false;
+    for (Instruction *ph : it->second) {
+      Value *incoming = nullptr;
+      for (size_t k = 0; k + 1 < ph->ops.size(); k += 2)
+        if (ph->ops[k] == bb) incoming = ph->ops[k + 1];
+      if (!incoming || incoming == ph) continue;
+      int32_t pr = L.phiRegs.at(ph);
+      if (cv == pr) return true;
+      auto readsOld = [&](Value *value) {
+        std::vector<Value *> values{value};
+        std::unordered_set<Value *> seen;
+        // Pointer expressions may be materialized only at a later use. Trace
+        // their dependencies as well as scalar aliases already bound to pr.
+        bool pointer = value->ty == Type::Ptr;
+        while (!values.empty()) {
+          Value *v = values.back(); values.pop_back();
+          if (!seen.insert(v).second) continue;
+          auto reg = L.vreg.find(v);
+          if (v == ph || (reg != L.vreg.end() && reg->second == pr)) return true;
+          if (pointer)
+            if (auto *inst = dynamic_cast<Instruction *>(v))
+              for (Value *op : inst->ops) values.push_back(op);
+        }
+        return false;
+      };
+      std::vector<BasicBlock *> todo{other};
+      std::unordered_set<BasicBlock *> seen;
+      while (!todo.empty()) {
+        BasicBlock *b = todo.back(); todo.pop_back();
+        // Entering the phi owner defines the next iteration's value.
+        if (b == target || !seen.insert(b).second) continue;
+        for (auto &iu : b->instrs)
+          for (Value *op : iu->ops)
+            if (readsOld(op)) return true;
+        if (b->instrs.empty()) continue;
+        auto *term = b->instrs.back().get();
+        if (term->op == Op::Br) {
+          todo.push_back(static_cast<BasicBlock *>(term->ops[0]));
+        } else if (term->op == Op::CondBr) {
+          todo.push_back(static_cast<BasicBlock *>(term->ops[1]));
+          todo.push_back(static_cast<BasicBlock *>(term->ops[2]));
+        }
+      }
+    }
+    return false;
+  };
+  auto armLabel = [&](BasicBlock *target, BasicBlock *other) {
+    if (!needsEdge(target, other)) {
+      emitPhiCopies(target);
+      return L.labelFor(target);
+    }
+    MBlock edge;
+    size_t id = L.phiEdges.size();
+    for (;;) {
+      edge.name = L.labelFor(bb) + "_phi_edge" + std::to_string(id++);
+      bool collision = false;
+      for (auto &b : L.fn->blocks) collision |= L.labelFor(b.get()) == edge.name;
+      for (auto &b : L.phiEdges) collision |= b.name == edge.name;
+      if (!collision) break;
+    }
+    MBlock *previous = L.cur;
+    auto constants = std::move(L.blkConst);
+    L.blkConst.clear();
+    L.cur = &edge;
+    emitPhiCopies(target);
+    MInst jump;
+    jump.op = MOp::Jmp; jump.sym = L.labelFor(target); jump.line = line;
+    L.emit(jump);
+    L.cur = previous;
+    L.blkConst = std::move(constants);
+    std::string label = edge.name;
+    L.phiEdges.push_back(std::move(edge));
+    return label;
+  };
+  std::string thenL = armLabel(thenB, elseB);
+  std::string elseL = armLabel(elseB, thenB);
   MInst m;
   m.line = line;
   m.a = cv;
@@ -1692,6 +1781,23 @@ void fuseBranchCompares(FnLower &L) {
     return m.op == MOp::MoveX || m.op == MOp::MoveF || m.op == MOp::Li ||
            m.op == MOp::LiF;
   };
+  // Match comparisons already lowered to RISC-V ALU instructions as well as
+  // the generic ICmp. Zero thresholds can use x0 directly; keep other small
+  // immediate comparisons in ALU form rather than adding long-lived constants.
+  auto comparison = [](const MInst &m, Cond &c, int32_t &a, int32_t &b,
+                       bool &immediate) {
+    a = m.a; b = m.b; immediate = false;
+    switch (m.op) {
+    case MOp::ICmp: c = (Cond)m.imm; return true;
+    case MOp::ISlt: c = Cond::Lt; return true;
+    case MOp::ISlti: c = Cond::Lt; immediate = true; return true;
+    case MOp::ISltuZ: c = Cond::Ne; b = -1; return true;
+    case MOp::ISltiu:
+      if (m.imm == 1) { c = Cond::Eq; b = -1; return true; }
+      return false;
+    default: return false;
+    }
+  };
   for (auto &b : L.mf.blocks) {
     auto &v = b.instrs;
     // True when a transparent instruction in [from, to) writes `ra` or `rb`.
@@ -1712,40 +1818,47 @@ void fuseBranchCompares(FnLower &L) {
         while (j >= 0 && transparent(v[(size_t)j]) &&
                v[(size_t)j].dst != m.a && v[(size_t)j].a != m.a)
           --j;
-        if (j >= 0 && v[(size_t)j].op == MOp::ICmp &&
-            v[(size_t)j].dst == m.a && use[(size_t)m.a] == 1 &&
-            !clobbersBetween((size_t)j + 1, i, v[(size_t)j].a,
-                             v[(size_t)j].b)) {
-          Cond c = (Cond)v[(size_t)j].imm;
-          if (!branchOnTrue) c = invertCond(c);
-          m.op = MOp::BrCmp;
-          m.a = v[(size_t)j].a;
-          m.b = v[(size_t)j].b;
-          m.imm = (int32_t)c;
-          v.erase(v.begin() + j);
-          --i;
-          continue;
-        }
-        // compare then xor 1 (logical not of a comparison)
-        if (j >= 1 && v[(size_t)j].op == MOp::IXorI &&
-            v[(size_t)j].imm == 1 && v[(size_t)j].dst == m.a &&
-            use[(size_t)m.a] == 1 && v[(size_t)j - 1].op == MOp::ICmp &&
-            v[(size_t)j - 1].dst == v[(size_t)j].a &&
-            use[(size_t)v[(size_t)j].a] == 1 &&
-            !clobbersBetween((size_t)j + 1, i, v[(size_t)j - 1].a,
-                             v[(size_t)j - 1].b)) {
-          Cond c = (Cond)v[(size_t)j - 1].imm;
-          if (branchOnTrue) c = invertCond(c);
-          m.op = MOp::BrCmp;
-          m.a = v[(size_t)j - 1].a;
-          m.b = v[(size_t)j - 1].b;
-          m.imm = (int32_t)c;
-          // remove the xor and the compare but keep any transparent phi
-          // copies that sit between them and the branch.
-          v.erase(v.begin() + j);      // xor
-          v.erase(v.begin() + (j - 1)); // compare
-          i -= 2;
-          continue;
+        if (j >= 0 && v[(size_t)j].dst == m.a && use[(size_t)m.a] == 1) {
+          bool negated = v[(size_t)j].op == MOp::IXorI && v[(size_t)j].imm == 1;
+          long long ci = negated ? j - 1 : j;
+          Cond c = Cond::Eq;
+          int32_t a = -1, rhs = -1;
+          bool immediate = false;
+          if (ci >= 0 && (!negated ||
+              (v[(size_t)ci].dst == v[(size_t)j].a &&
+               use[(size_t)v[(size_t)j].a] == 1)) &&
+              comparison(v[(size_t)ci], c, a, rhs, immediate) &&
+              !clobbersBetween((size_t)ci + 1, i, a, rhs)) {
+            int32_t constant = v[(size_t)ci].imm;
+            // Signed x < 1 is x <= 0, so its branch can use x0 directly.
+            // Avoid keeping a materialized 1 live across calls/loop bodies.
+            if (immediate && constant == 1) {
+              c = Cond::Le;
+              constant = 0;
+            }
+            if (immediate && constant != 0) {
+              // slti + branch is already a cheap immediate comparison. A
+              // materialized bound can raise loop pressure (e.g. a dispatch
+              // with several bounds). Remove only the redundant boolean not,
+              // provided phi copies have not overwritten the original result.
+              if (negated && !clobbersBetween((size_t)j + 1, i,
+                                              v[(size_t)ci].dst, -1)) {
+                m.op = branchOnTrue ? MOp::BrZ : MOp::BrNz;
+                m.a = v[(size_t)ci].dst;
+                v.erase(v.begin() + j);
+                --i;
+                continue;
+              }
+              ++i;
+              continue;
+            }
+            if (negated == branchOnTrue) c = invertCond(c);
+            m.op = MOp::BrCmp;
+            m.a = a; m.b = rhs; m.imm = (int32_t)c;
+            if (negated) { v.erase(v.begin() + j); --i; }
+            v.erase(v.begin() + ci); --i;
+            continue;
+          }
         }
       }
       ++i;
@@ -1812,14 +1925,15 @@ std::vector<MachineFunc> InstructionSelector::select(Module *mod) {
       }
       lowerTerminator(L, bb, bi);
     }
+    for (auto &edge : L.phiEdges) L.mf.blocks.push_back(std::move(edge));
     L.mf.localBytes = L.nextFrameByte;
     L.mf.maxStkArgBytes = L.maxStk;
     fuseBranchCompares(L);
 
     // Export the range analysis' non-negativity facts to the machine-level
     // strength reducer: for a non-negative dividend a constant division is an
-    // *unsigned* division, and RISC-V's `mulhu` computes it in two instructions
-    // where the signed magic needs six (see MachineOpt's magicu).
+    // *unsigned* division, and a full-width multiply/shift sequence can avoid
+    // the signed quotient's correction steps (see MachineOpt's magicu).
     //
     // A register with several definitions is a phi: ISel writes it from a copy
     // in every predecessor, so `nonNeg` may only be attached when the phi

@@ -284,6 +284,22 @@ private:
       }
       if (!ok || phis == 0 || plans.empty()) continue;
 
+      // rv64gc has neither a conditional move nor integer min/max. A direct
+      // min/max diamond needs one compare-branch and at most one copy, while
+      // Select would add a comparison plus a five-ALU mask sequence and keep
+      // both values live. Preserve that cheap diamond. Bit-test selections
+      // retain their existing conversion; this is not a blanket branch ban.
+      auto *comparison = dynamic_cast<Instruction *>(cond);
+      bool directMinMax = false;
+      if (comparison && comparison->op == Op::ICmp && comparison->ops.size() == 2 &&
+          comparison->cond != Cond::Eq && comparison->cond != Cond::Ne) {
+        for (const Plan &p : plans)
+          if ((p.vt == comparison->ops[0] && p.vf == comparison->ops[1]) ||
+              (p.vf == comparison->ops[0] && p.vt == comparison->ops[1]))
+            directMinMax = true;
+      }
+      if (directMinMax) continue;
+
       apply(mod, f, c, si, mi, cond, arms, plans);
       return true; // CFG changed: rebuild and look again
     }

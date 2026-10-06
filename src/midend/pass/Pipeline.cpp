@@ -64,6 +64,10 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
     // Matmul ijk->ikj before LICM/unroll so the rewritten nests benefit from
     // both (LLVM LoopInterchange-style locality for array/matrix kernels).
     if (aggr) pm.addPass(makeMatmulIkjPass(Layer::Affine));
+    if (aggr && !std::getenv("SAKU_NO_POLYHEDRAL"))
+      pm.addPass(makePolyhedralPass());
+    if (aggr && !std::getenv("SAKU_NO_LOOP_SPLIT"))
+      pm.addPass(makeLoopSplitPass());
     pm.addPass(makeLicmPass(Layer::Affine));
     pm.addPass(makeLoopUnrollPass(Layer::Affine));
     addCleanupRound(pm, Layer::Affine, aggr);
@@ -112,6 +116,16 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
     // those functions keep their memory form - correct, if less promoted.
     pm.addPass(makeMem2RegPass());
     addCleanupRound(pm, Layer::Cf, aggr);
+    // Promotion and cleanup reveal the actual helper size and constant
+    // arguments. Revisit these sites with a bounded specialization budget:
+    // constant controls can eliminate whole branch chains in the clone.
+    if (aggr && !getenv("SAKU_NO_CONSTINLINE")) {
+      pm.addPass(makeInlineGeneralPass(true));
+      pm.addPass(makeCfgSimplifyPass());
+      pm.addPass(makeMem2RegPass());
+      addCleanupRound(pm, Layer::Cf, aggr);
+      pm.addPass(makeCfgSimplifyPass());
+    }
     // Branchless if-conversion (LLVM's SimplifyCFG two-entry-PHI select).
     // The bit-at-a-time kernels are a dense chain of one-instruction `if`s;
     // after promotion each is a two-entry diamond whose phi the back-end would
@@ -157,6 +171,8 @@ void addOptPipeline(PassManager &pm, OptLevel level) {
     pm.addPass(makeDomCsePass(Layer::Cf));
     addCleanupRound(pm, Layer::Cf, aggr);
     pm.addPass(makeRemoveUnusedPass(Layer::Cf));
+    if (aggr && !std::getenv("SAKU_NO_BLOCK_LAYOUT"))
+      pm.addPass(makeBlockLayoutPass());
   }
 
   // Back-end gate: assert no tensor / affine / scf op survives, so the

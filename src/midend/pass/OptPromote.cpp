@@ -546,7 +546,8 @@ private:
   // Runs to a fixpoint (one fold can expose another).  A phi that only
   // receives itself is left alone.
   void foldPhis(Module &mod, Function &f,
-                std::unordered_set<Instruction *> &eraseSet) {
+                std::unordered_set<Instruction *> &eraseSet,
+                std::unordered_map<Instruction *, Value *> &rep) {
     bool again = true;
     while (again) {
       again = false;
@@ -570,6 +571,11 @@ private:
           }
           if (!same || !uniq || uniq == (Value *)ph) continue;
           replaceAllUses(mod, ph, uniq);
+          // Promotion replacements are not IR operands. Keep their targets
+          // alive as well: applyRep runs again after this fixpoint, and may
+          // otherwise dynamic_cast a phi that was just destroyed here.
+          for (auto &kv : rep)
+            if (kv.second == (Value *)ph) kv.second = uniq;
           it = bb->instrs.erase(it); // iterator valid: points at next
           eraseSet.erase(ph);
           again = true;
@@ -646,7 +652,7 @@ private:
       }
     };
     applyRep(mod, rep);
-    foldPhis(mod, f, eraseSet);
+    foldPhis(mod, f, eraseSet, rep);
     applyRep(mod, rep);
     for (auto &bb : f.blocks)
       for (auto it = bb->instrs.begin(); it != bb->instrs.end();)

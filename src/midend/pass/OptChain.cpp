@@ -23,6 +23,8 @@
 // ---------------------------------------------------------------------------
 #include "Opt.h"
 
+#include <algorithm>
+
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <climits>
 #include <cstdint>
+#include <ostream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -24,23 +25,26 @@ namespace {
 // ---------------------------------------------------------------------------
 // palettes: color index -> physical register number
 // ---------------------------------------------------------------------------
+// Short-lived values use caller-saved registers first.  Consuming s/fs
+// registers first both adds prologue traffic to leaf functions and deprives
+// values crossing calls of the only colours they can use.
 const int kXFullPhys[] = {
-    8, 9,                             // s0, s1
     10, 11, 12, 13, 14, 15, 16, 17,   // a0..a7
-    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, // s2..s11
     7,                                // t2
-    28, 29, 30, 31                    // t3..t6
+    28, 29, 30, 31,                   // t3..t6
+    8, 9,                             // s0, s1
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27 // s2..s11
 };
 constexpr int kXFull = 25;
 const int kXCalleePhys[] = {8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27};
 constexpr int kXCallee = 12;
 
 const int kFFullPhys[] = {
-    8, 9,                             // fs0, fs1
     10, 11, 12, 13, 14, 15, 16, 17,   // fa0..fa7
-    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, // fs2..fs11
     2, 3, 4, 5, 6, 7,                 // ft2..ft7
-    28, 29, 30, 31                    // ft8..ft11
+    28, 29, 30, 31,                   // ft8..ft11
+    8, 9,                             // fs0, fs1
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27 // fs2..fs11
 };
 constexpr int kFFull = 30;
 const int kFCalleePhys[] = {8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27};
@@ -566,7 +570,13 @@ struct Allocator {
       return d;
     };
     auto Kof = [&](int32_t i) {
-      return crossing[(size_t)nodes[(size_t)i]] ? Kcal : Kfull;
+      bool crosses = crossing[(size_t)nodes[(size_t)i]];
+      const int *pal = crosses ? calPhys : fullPhys;
+      int count = crosses ? Kcal : Kfull;
+      int available = 0;
+      for (int k = 0; k < count; ++k)
+        available += !forbid[(size_t)i][(size_t)pal[k]];
+      return available;
     };
 
     for (;;) {
@@ -642,7 +652,7 @@ struct Allocator {
     bool ok = true;
     for (int32_t si = (int32_t)stack.size() - 1; si >= 0; --si) {
       int32_t i = stack[(size_t)si];
-      int32_t K = Kof(i);
+      int32_t K = crossing[(size_t)nodes[(size_t)i]] ? Kcal : Kfull;
       std::vector<char> used(32, 0);
       for (int32_t j = 0; j < n; ++j)
         if (adj[(size_t)i][(size_t)j] && c[(size_t)j] >= 0)
@@ -820,7 +830,7 @@ struct Allocator {
 } // namespace
 
 // ---------------------------------------------------------------------------
-void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
+void RegisterAllocator::allocate(std::vector<MachineFunc> &fns, std::ostream *stats) {
   for (auto &f : fns) {
     Allocator A(f);
     A.trimDead();
@@ -828,6 +838,7 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
     A.buildCFG();
 
     std::vector<int32_t> color; // vreg -> physical register
+    int attempts = 0, peakX = 0, peakF = 0, callX = 0, callF = 0;
     int prevUncolored = INT32_MAX;
     // One colouring attempt.  Fills `color` and returns true on success; on
     // failure it rewrites the function to spill what could not be coloured
@@ -839,6 +850,35 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
       A.computeFiles();
       std::vector<char> crossing;
       A.computeLiveness(crossing);
+      if (++attempts == 1 && stats) {
+        for (size_t bi = 0; bi < f.blocks.size(); ++bi) {
+          auto live = A.liveOut[bi];
+          auto countLive = [&](bool atCall) {
+            int x = 0, fp = 0;
+            for (size_t r = 0; r < live.size(); ++r)
+              if (live[r]) (A.isF[r] ? fp : x)++;
+            peakX = std::max(peakX, x);
+            peakF = std::max(peakF, fp);
+            if (atCall) {
+              callX = std::max(callX, x);
+              callF = std::max(callF, fp);
+            }
+          };
+          countLive(false);
+          const auto &insts = f.blocks[bi].instrs;
+          for (size_t k = insts.size(); k-- > 0;) {
+            const auto &m = insts[k];
+            OpSlots sl = slots(m);
+            if (sl.def >= 0) live[(size_t)sl.def] = 0;
+            if (m.op == MOp::Call) countLive(true);
+            for (int r : sl.use)
+              if (r >= 0) live[(size_t)r] = 1;
+            for (const auto &a : m.args)
+              if (a.vreg >= 0) live[(size_t)a.vreg] = 1;
+            countLive(false);
+          }
+        }
+      }
       A.buildCFG();
       A.computeSpillWeights();
       A.buildGraph();
@@ -933,6 +973,21 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns) {
     std::sort(f.usedCSF.begin(), f.usedCSF.end());
     f.usedCSF.erase(std::unique(f.usedCSF.begin(), f.usedCSF.end()),
                     f.usedCSF.end());
+
+    if (stats) {
+      int loads = 0, stores = 0;
+      for (const auto &b : f.blocks)
+        for (const auto &m : b.instrs) {
+          loads += m.op == MOp::SpillLw || m.op == MOp::SpillFlw;
+          stores += m.op == MOp::SpillSw || m.op == MOp::SpillFsw;
+        }
+      *stats << "backend-ra " << f.name << ": peak-x=" << peakX
+             << " peak-f=" << peakF << " call-live-x=" << callX
+             << " call-live-f=" << callF << " rounds=" << attempts
+             << " spill-slots=" << f.spillCount << " spill-loads=" << loads
+             << " spill-stores=" << stores << " saved-x=" << f.usedCSX.size()
+             << " saved-f=" << f.usedCSF.size() << '\n';
+    }
 
     // bake physical registers into the machine code
     for (auto &b : f.blocks)

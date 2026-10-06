@@ -7,8 +7,9 @@
 //
 //   * peephole  - drops dead / self / zero-extending moves, folds x+0 / x^0
 //     moves, x-x / x^x into li 0, removes Nops.
-//   * schedule  - hoists register-addressed loads (lw/flw) as early as their
-//     dependencies allow within each barrier-delimited straight-line segment,
+//   * schedule  - hoists register-addressed loads (lw/flw) within a short
+//     latency window, respecting all register dependencies and load order,
+//     and never increasing peak liveness in either register file,
 //     giving the (in-order) pipeline an earlier start on memory latency.
 //     Loads never cross a store / call / branch / prologue, so memory
 //     ordering is preserved exactly.

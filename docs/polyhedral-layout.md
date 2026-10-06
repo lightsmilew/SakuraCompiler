@@ -1,0 +1,108 @@
+# 多面体循环调度与基本块布局
+
+本轮在 `-O2` 增加 `polyhedral-schedule` 和 `block-layout`。前者运行于
+Affine 层、矩阵乘法专用变换之后、LICM/展开之前；后者运行于 Cf 层
+所有优化结束后、指令选择之前。`-O0`、`-O1` 的流水线不增加这两个 pass。
+
+## 文献与实现对应
+
+* Bondhugula 等，PLDI 2008，[A Practical Automatic Polyhedral Parallelizer
+  and Locality Optimizer](https://www.csa.iisc.ac.in/~udayb/publications/uday-pldi08.pdf)：
+  将迭代域、访存关系和执行调度分别建模，用依赖约束决定变换是否合法。
+  本实现采用该原则，但只搜索二维矩形 band 的交换和分块调度；没有
+  引入 Pluto 的一般 ILP 求解器、自动并行化或任意维度调度。
+* [MLIR Affine dialect](https://mlir.llvm.org/docs/Dialects/Affine/) 和
+  [LoopUtils 的循环交换合法性检查](https://mlir.llvm.org/doxygen/LoopUtils_8cpp_source.html)：
+  在仍保留结构化循环及仿射访问的层进行依赖分析和循环变换。
+  Sakura 的 Affine 层目前用内存槽表达 IV，必须另外检查槽的逃逸及最终值。
+* Pettis、Hansen，PLDI 1990，[Profile Guided Code Positioning](https://pages.cs.wisc.edu/~fischer/cs701.f05/code.positioning.pdf)：
+  依据带权 CFG 构造连续路径。本实现对应论文的 top-down 算法，使用静态
+  估计代替执行计数；不是 profile-guided 优化。
+* [LLVM MachineBlockPlacement](https://llvm.org/doxygen/MachineBlockPlacement_8cpp_source.html)：
+  根据 CFG、循环结构和分支概率组织相邻路径。LLVM 的最终布局主要在
+  Machine IR 实现；Sakura 在 Cf 层排序，因为当前指令选择已经能根据
+  下一块省略跳转、反转条件分支，后端仍保留现有的局部布局旋转。
+
+## 循环变换的合法性
+
+`OptPolyhedral.cpp` 提取常量矩形域
+`lb0 <= i < ub0, lb1 <= j < ub1`，以及四字节访问的仿射字节地址
+`root + a*i + b*j + c`。表达式允许 IV 读取、常量、加减和乘常量；
+逐个中间表达式检查 i32 范围，防止把整数回绕误当成仿射运算。
+下界可以从私有 IV 槽沿唯一前驱链追溯到常量 store；跨越结构化循环
+之前检查它的所有区域都没有修改该槽。分支汇合和未知下界保守停止追溯。
+
+对同一对象的访问对，只要包含写操作，就检查 RAW、WAR、WAW 冲突。
+具有相同线性系数的访问满足：
+
+```
+a*di + b*dj = c_source - c_sink
+-(N0-1) <= di <= N0-1
+-(N1-1) <= dj <= N1-1
+```
+
+原调度 `(i,j,statement)` 交换为 `(j,i,statement)` 时，只有两个
+位移分量异号才会反转顺序。因此检查上述整数约束在两个异号象限是否
+有解；有解则拒绝整个 band。这里使用精确的一维位移枚举加整除检验，
+较短轴超过 4096 时保守拒绝，不枚举全部动态迭代实例。不同线性系数
+且含写操作的同根访问、未知参数别名、调用、条件分支及其它未建模
+副作用也拒绝；不同全局对象和本帧不同 alloca 可证明不重叠。
+
+只有两个非空、至少两次迭代、步长 1 的矩形循环可匹配。允许的外层
+前缀只有内层 IV 的常量初始化。IV 必须是未逃逸的私有 i32 槽，且
+叶子不能写 IV。变换后各 IV 的最终值仍为原上界。零次迭代、三角形域、
+动态范围及一般不完美嵌套均保留原循环。
+
+合法性证明和收益选择相互独立：
+
+* 交换：比较两个维度的字节步幅成本，写访问权重为读的两倍；新内层
+  成本低于原内层一半才交换。保留叶子语句顺序。
+* 分块：存在跨外层迭代重复读取的输入，且两轴各至少 64 个点时，
+  选择 32×32 tile。新调度为 `(Ti,Tj,i,j,statement)`；已有的无异号
+  冲突条件保证矩形分块合法。尾块用 `min(tile+32,ub)` 截断，并检查
+  tile 增量和上界计算不会回绕。
+
+这不是浮点归约重结合。不同输出元素的执行可以交错，但同一地址的
+累加顺序必须由上述依赖检查保留。标量二维归约会被拒绝。
+
+## 基本块布局
+
+原中端有 CFG 简化、循环旋转及个别块合并，没有独立的通用布局 pass。
+新增 `OptBlockLayout.cpp` 使用实际 CFG、支配关系和自然循环成员关系
+估计热度，多回边指向同一 header 时合并为一个循环，避免重复加权。
+
+从 entry 开始，每步从可放置的块中选择分数最高者：优先更深的循环，
+其次优先上一块的直接后继，再用两个相邻块的调用数量作为有上限的
+辅助权重；原顺序提供确定性平局处理。调用数量不等于执行频率，这个
+权重不会越过循环热度或定义先于使用的约束。
+
+硬约束包含支配块先行、普通 SSA 定义先于使用，以及 Phi 输入值的定义
+先于负责复制它的前驱块。Phi 寄存器已经由后端预绑定。排序只移动
+`unique_ptr`，保持 BasicBlock/Instruction 身份、分支目标和 Phi 输入
+不变。无法满足约束、有定义顺序环或超过 2048 块的函数原样保留。
+
+布局有机会减少跳转和热路径代码跨度；循环交换、分块主要改善数据
+访问与复用。分支预测命中率、I-cache miss 的实际变化须由目标硬件
+计数器验证，QEMU TCG 耗时不能直接推导这两个指标。
+
+## 验证与开关
+
+`polyhedral_layout_regression` 用独立结构化 IR 解释器比较完整原始对象
+内存和 IV 最终值；另用 84 组正负系数及偏移穷举位移域，对照依赖
+判定。还覆盖分块尾部、零次循环、非单位步长、回绕、别名、调用、
+Phi 身份及后端定义顺序。`cases/optimization` 提供六个可直接编译运行
+的 SysY 样例；`.out` 含标准输出及退出码，预期值由 GCC `-O0` 独立运行生成。
+浮点样例用大数、负大数和小数交替累加，检查交换循环后仍保持每个输出
+元素的累加顺序。全量与 LLVM 对比结果见
+[验证报告](performance2026-polyhedral-results.md)。
+
+```sh
+cmake -S . -B build/tests -DCMAKE_BUILD_TYPE=Release -DSAKURA_BUILD_TESTS=ON
+cmake --build build/tests -j2
+ctest --test-dir build/tests --output-on-failure
+build/compiler cases/optimization/02_poly_tile_tail.sy -O2 --pass-stats -o build/tile.s
+```
+
+可分别设置 `SAKU_NO_POLYHEDRAL=1`、`SAKU_NO_POLY_TILE=1`、
+`SAKU_NO_BLOCK_LAYOUT=1` 作 A/B 对照。日志中的 `changed` 表示 IR 发生
+变换，不能解释为性能已经提升。
