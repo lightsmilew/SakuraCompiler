@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end correctness check: compiles the cases with the local compiler,
 # pushes the .s/.in/.out files to the RISC-V Ubuntu VM (QEMU, ssh :2222) and
-# runs tools/guest_test.sh there (assemble + link with libsysy_riscv + run +
+# runs tools/test/guest_test.sh there (assemble + link with libsysy_riscv + run +
 # diff against .out).
 #
 # Verification cache: the assembly verified on a previous run is kept under
@@ -13,12 +13,12 @@
 # regression nearly free after the first clean pass.
 #
 # Usage:
-#   ./tools/qemu_verify.sh                      # cases/functional
-#   ./tools/qemu_verify.sh functional h_functional
-#   ./tools/qemu_verify.sh performance2026
+#   ./tools/test/qemu_verify.sh                      # cases/functional
+#   ./tools/test/qemu_verify.sh functional h_functional
+#   ./tools/test/qemu_verify.sh performance2026
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 QEMU_HOST="${QEMU_HOST:-localhost}"
@@ -26,7 +26,9 @@ QEMU_PORT="${QEMU_PORT:-2222}"
 QEMU_USER="${QEMU_USER:-ubuntu}"
 QEMU_PASS="${QEMU_PASS:-WSJ040511}"
 REMOTE_ROOT="${REMOTE_ROOT:-/home/ubuntu/saku_verify}"
-COMP="${COMP:-$ROOT/build/compiler}"
+BUILD_TREE="${BUILD_DIR:-build}"
+case "$BUILD_TREE" in /*) ;; *) BUILD_TREE="$ROOT/$BUILD_TREE" ;; esac
+COMP="${COMP:-$BUILD_TREE/compiler}"
 STAGING="${STAGING:-/tmp/saku_verify_stage}"
 STAGING_RUN="${STAGING_RUN:-/tmp/saku_verify_stage_run}"
 CACHE_DIR="${CACHE_DIR:-$ROOT/build/.verify_cache}"
@@ -119,7 +121,7 @@ if [ ${#run_suites[@]} -gt 0 ]; then
   for suite in "${run_suites[@]}"; do
     scp_cmd -r "$STAGING_RUN/$suite" "${QEMU_USER}@${QEMU_HOST}:$REMOTE_ROOT/"
   done
-  scp_cmd "$ROOT/tools/guest_test.sh" "${QEMU_USER}@${QEMU_HOST}:/tmp/guest_test.sh"
+  scp_cmd "$ROOT/tools/test/guest_test.sh" "${QEMU_USER}@${QEMU_HOST}:/tmp/guest_test.sh"
 
   echo "== guest run =="
   args=""

@@ -1,5 +1,7 @@
 cases/*
-build/
-vm/
+/build/
+/vm/
+results/*
+__pycache__/
 *.o
 *.elf

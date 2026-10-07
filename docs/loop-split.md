@@ -105,8 +105,6 @@ the complete source regression (`60_sort_test6`), and fixed before final timing.
 nonassociative floating-point and two timed branch-heavy array cases. Expected
 outputs are independently generated with GCC `-O0 -ffp-contract=off`. RISC-V
 execution compares these against the prior compiler and LLVM, with repeated
-timings for the two hot cases. All 236 programs and 1361 executions passed;
-the two hot cases improved by 2.307x and 1.462x in QEMU. Real performance2026
-cases showed mixed results and no stable suite improvement. See
-[measurements and the seven-run recheck](loop-split-results.md) for the complete
+timings for the two hot cases. See
+[measurements and the seven-run recheck](../results/loop-split/loop-split-results.md) for the complete
 results, hashes and limits of these measurements.

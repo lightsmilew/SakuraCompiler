@@ -39,12 +39,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "OptUtil.h"
+#include "../ir/RangeAnalysis.h"
 
 namespace sakura {
 namespace ir {
@@ -71,6 +73,7 @@ struct Rewriter {
   BasicBlock *preB = nullptr;
   std::unordered_map<const Instruction *, Value *> preMemo;
   std::unordered_map<std::string, Value *> invMemo;
+  std::unordered_map<Value *, std::pair<int64_t, int64_t>> related;
 
   Rewriter(Module &m, Function &fn, const std::vector<uint8_t> &il,
            std::unordered_map<const Instruction *, size_t> &bo)
@@ -191,6 +194,10 @@ struct Rewriter {
     if (v == iv) {
       out.k = 1;
       return true;
+    }
+    auto relation = related.find(v);
+    if (relation != related.end()) {
+      out.k = relation->second.first; out.c = relation->second.second; return true;
     }
     if (auto *ci = asConstInt(v)) {
       out.c = ci->v;
@@ -313,6 +320,7 @@ public:
     // Only the flat cf layer has cf.phi; earlier layers still carry the
     // structured loop ops, whose addressing is handled by LICM / unrolling.
     if (layer_ != Layer::Cf) return false;
+    inferObjectBounds(mod);
     bool any = false;
     for (auto &f : mod.functions()) {
       if (f->isLib || f->blocks.size() < 3) continue;
@@ -323,6 +331,50 @@ public:
 
 private:
   Layer layer_;
+  std::unordered_map<Value *, int64_t> objectBounds_;
+
+  // Whole-program call sites can bound the backing object of an array
+  // parameter without assuming a runtime index bound. Unknown callers or
+  // roots keep the parameter unknown; recursive cycles are conservative.
+  void inferObjectBounds(Module &mod) {
+    objectBounds_.clear();
+    auto objectSize = [](Value *root) -> int64_t {
+      int64_t count = 0;
+      if (auto *g = dynamic_cast<GlobalVar *>(root)) count = g->elems;
+      if (auto *a = dynamic_cast<Instruction *>(root))
+        if (a->op == Op::Alloca) count = a->n;
+      return count > 0 && count <= INT32_MAX/4 ? count*4 : 0;
+    };
+    for (auto &fn : mod.functions()) for (auto &bb : fn->blocks)
+      for (auto &u : bb->instrs)
+        for (Value *v : u->ops) {
+          Value *root = addressOf(v).root;
+          int64_t bytes = objectSize(root);
+          if (bytes) objectBounds_[root] = bytes;
+        }
+    for (size_t round = 0; round < mod.functions().size(); ++round) {
+      bool changed = false;
+      for (auto &callee : mod.functions()) {
+        if (callee->isLib || callee->name == "main") continue;
+        for (size_t k = 0; k < callee->args.size(); ++k) {
+          Value *arg = callee->args[k].get();
+          if (arg->ty != Type::Ptr || objectBounds_.count(arg)) continue;
+          int64_t maximum = 0; bool unknown = false;
+          for (auto &caller : mod.functions()) for (auto &bb : caller->blocks)
+            for (auto &u : bb->instrs) {
+              if (u->op != Op::Call || u->ops.empty() || u->ops[0] != callee.get()) continue;
+              if (k+1 >= u->ops.size()) { unknown = true; continue; }
+              Value *root = addressOf(u->ops[k+1]).root;
+              auto it = objectBounds_.find(root);
+              if (it == objectBounds_.end()) unknown = true;
+              else maximum = std::max(maximum, it->second);
+            }
+          if (!unknown && maximum) { objectBounds_[arg] = maximum; changed = true; }
+        }
+      }
+      if (!changed) break;
+    }
+  }
 
   static void succsOf(BasicBlock *bb, std::vector<BasicBlock *> &out) {
     if (bb->instrs.empty()) return;
@@ -360,6 +412,7 @@ private:
     // increment) instead of materialising a distinct preheader value each.
     int64_t c = 0;
     const IV *iv = nullptr;
+    bool pointerSafe = false;
   };
 
   bool processFunction(Module &mod, Function &f) {
@@ -455,7 +508,7 @@ private:
       std::vector<IV> ivs;
       for (auto &iu : f.blocks[hh]->instrs) {
         Instruction *phi = iu.get();
-        if (phi->op != Op::Phi) continue;
+        if (phi->op != Op::Phi || phi->ty != Type::I32) continue;
         Value *init = nullptr;
         std::vector<Value *> nextValues;
         for (size_t k = 0; k + 1 < phi->ops.size(); k += 2) {
@@ -505,6 +558,28 @@ private:
       }
       if (ivs.empty()) continue;
 
+      // Equal entry values and equal updates on *every* back edge describe
+      // the same recurrence, including wrapping i32 arithmetic. Do not merge
+      // counters merely because their strides happen to match.
+      if (!std::getenv("SAKU_NO_IV_REUSE")) {
+        for (size_t j = 0; j < ivs.size(); ++j)
+          for (size_t i = 0; i < j; ++i) {
+            const auto *a = asConstInt(ivs[i].init), *b = asConstInt(ivs[j].init);
+            if (ivs[i].step != ivs[j].step ||
+                !(ivs[i].init == ivs[j].init || (a && b && a->v == b->v))) continue;
+            auto *old = ivs[j].phi;
+            replaceAllUses(mod, old, ivs[i].phi);
+            // Its otherwise dead update still refers to the surviving phi;
+            // ordinary cleanup removes it after retiring this redundant phi.
+            auto &v = f.blocks[hh]->instrs;
+            v.erase(std::remove_if(v.begin(), v.end(), [&](auto &u) { return u.get() == old; }), v.end());
+            blockOf.erase(old);
+            ivs.erase(ivs.begin() + (long)j--);
+            any = true;
+            break;
+          }
+      }
+
       Rewriter rw(mod, f, inLoop, blockOf);
       rw.preB = f.blocks[ph].get();
 
@@ -518,11 +593,22 @@ private:
           if (ins->op != Op::Gep || ins->ops.size() != 2) continue;
           if (seen.count(ins)) continue;
           for (const IV &iv : ivs) {
+            rw.related.clear();
+            if (!std::getenv("SAKU_NO_IV_REUSE")) {
+              auto *seed = asConstInt(iv.init);
+              for (const IV &other : ivs) {
+                auto *start = asConstInt(other.init);
+                if (&other == &iv || !seed || !start || other.step % iv.step) continue;
+                int64_t factor = other.step / iv.step;
+                int64_t displacement = int64_t(start->v) - factor * seed->v;
+                if (factor < INT32_MIN || factor > INT32_MAX ||
+                    displacement < INT32_MIN || displacement > INT32_MAX) continue;
+                rw.related[other.phi] = {factor, displacement};
+              }
+            }
             Rewriter::Aff aff;
             if (!rw.affine(ins->ops[1], iv.phi, aff, ph, 0)) continue;
             if (aff.bad || (aff.k == 0 && !aff.dynK)) continue;
-            int64_t delta = 0;
-            if (!mulFits(aff.k, iv.step, delta)) continue;
             // The base has to be available (and unchanged) in the preheader.
             if (auto *bd = dynamic_cast<Instruction *>(ins->ops[0])) {
               auto bit = blockOf.find(bd);
@@ -555,6 +641,14 @@ private:
         }
       }
       if (cands.empty()) continue;
+
+      // i32 offsets are sign-extended by GEP, whereas pointer increments are
+      // 64-bit. Reassociation is legal only while the signed offset does not
+      // wrap. Include the exiting header value, not only body iterations.
+      RangeAnalysis ranges;
+      ranges.run(&f);
+      for (auto &cd : cands)
+        cd.pointerSafe = guardedIV(cd.iv, f, inLoop, dom, idx) && offsetFits(cd, ranges, cd.c);
 
       // Identical (iv, base, k, invariant) tuples share one pointer phi; the
       // candidates' constants ride along as `gep phi, c` displacements.  The
@@ -598,6 +692,7 @@ private:
       groups = std::move(clusters);
       if (groups.size() > kMaxPerLoop) continue;
 
+      std::unordered_map<std::string, Instruction *> offsetRecurrences;
       for (const std::vector<const Cand *> &g : groups) {
         // A displacement is only "folded into the load/store" while it fits
         // the 12-bit signed immediate a `lw`/`sw` encodes.  A matrix row
@@ -623,11 +718,59 @@ private:
           // every remaining displacement fit the signed 12-bit encoding.
           c0 = hi - lo <= 2047 ? lo : lo + 2048;
         }
-        Instruction *p = buildPointer(rw, mod, f, *g[0], c0);
+        bool pointer = std::all_of(g.begin(), g.end(), [](const Cand *cd) { return cd->pointerSafe; }) &&
+                       offsetFits(*g[0], ranges, c0);
+        if (!pointer) {
+          for (const Cand *anchor : g)
+            if (anchor->c == c0 && objectProvesNoWrap(*anchor, f, blockOf, dom)) {
+              // Use an actually accessed anchor; an imaginary displacement
+              // could cross the signed boundary before any memory access.
+              bool sameObject = std::all_of(g.begin(), g.end(), [&](const Cand *cd) {
+                return addressOf(cd->base).root == addressOf(anchor->base).root &&
+                       memoryOnly(cd->gep, f);
+              });
+              pointer = sameObject;
+              break;
+            }
+        }
+        // A non-leaf row base is computed once per outer iteration already.
+        // Carrying another modular scalar through the inner loops usually
+        // costs a register without shortening their address critical path.
+        if (!pointer && (std::getenv("SAKU_NO_OFFSET_IV") ||
+            !std::all_of(g.begin(), g.end(), [&](const Cand *cd) { return memoryOnly(cd->gep, f); }) ||
+            !std::any_of(g.begin(), g.end(), [&](const Cand *cd) {
+              return memoryAccessEveryBackedge(*cd, f, blockOf, dom);
+            }))) continue;
+        // A modular recurrence still needs base+offset at each actual access.
+        // If a continue path skips all uses, its latch updates are extra work
+        // and extend live ranges without saving an address computation there.
+        // Without execution frequencies, require one unconditional access to
+        // amortize the carried offset. Proven pointer recurrences are separate.
+        Instruction *p = nullptr;
+        // A modular byte offset can also be shared by distinct base objects.
+        char offsetKey[128];
+        snprintf(offsetKey, sizeof offsetKey, "%p|%lld|%p|%p|%lld", (void *)g[0]->iv->phi,
+                 (long long)g[0]->k, (void *)g[0]->dynK, (void *)g[0]->inv, (long long)c0);
+        if (!pointer && offsetRecurrences.count(offsetKey)) p = offsetRecurrences.at(offsetKey);
+        else {
+          p = buildPointer(rw, mod, f, *g[0], c0, pointer);
+          if (!pointer && p) offsetRecurrences[offsetKey] = p;
+        }
         if (!p) continue;
         for (const Cand *cd : g) {
           int64_t disp = cd->c - c0;
-          if (disp == 0) {
+          if (!pointer) {
+            Value *off = p;
+            if (disp) {
+              auto add = std::make_unique<Instruction>(Op::Add, Type::I32);
+              add->ops = {p, mod.constInt((int32_t)disp)}; off = add.get();
+              auto bi = blockOf.at(cd->gep);
+              auto &code = f.blocks[bi]->instrs;
+              auto at = std::find_if(code.begin(), code.end(), [&](auto &u) { return u.get() == cd->gep; });
+              code.insert(at, std::move(add)); blockOf[(Instruction *)off] = bi;
+            }
+            cd->gep->ops[1] = off;
+          } else if (disp == 0) {
             // The phi already denotes this address: bypass the gep entirely.
             replaceAllUses(mod, cd->gep, p);
           } else {
@@ -637,8 +780,11 @@ private:
             cd->gep->ops[1] = mod.constInt((int32_t)disp);
           }
         }
+        if (pointer && !std::getenv("SAKU_NO_PTR_END"))
+          replaceLoopTest(rw, mod, f, *g[0], c0, p, ranges);
         any = true;
       }
+      retireDeadRecurrences(rw, f);
     }
     return any;
   }
@@ -650,6 +796,177 @@ private:
     return true;
   }
 
+  static bool guardedIV(const IV *iv, Function &f,
+                        const std::vector<uint8_t> &inLoop,
+                        const std::vector<std::vector<uint8_t>> &dom,
+                        const std::unordered_map<BasicBlock *, size_t> &idx) {
+    auto &head = f.blocks[iv->header]->instrs;
+    if (head.empty()) return false;
+    auto *br = head.back().get();
+    if (br->op != Op::CondBr || br->ops.size() != 3) return false;
+    auto *cmp = dynamic_cast<Instruction *>(br->ops[0]);
+    auto *body = dynamic_cast<BasicBlock *>(br->ops[1]);
+    if (!cmp || cmp->op != Op::ICmp || cmp->ops.size() != 2 ||
+        cmp->ops[0] != iv->phi || !body || !idx.count(body) || !inLoop[idx.at(body)]) return false;
+    for (size_t latch : iv->latches) if (!dom[latch][idx.at(body)]) return false;
+    auto *bound = asConstInt(cmp->ops[1]);
+    if (iv->step > 0 && (cmp->cond == Cond::Lt || cmp->cond == Cond::Le)) {
+      if (!bound) return cmp->cond == Cond::Lt && iv->step == 1;
+      return int64_t(bound->v) - (cmp->cond == Cond::Lt) + iv->step <= INT32_MAX;
+    }
+    if (iv->step < 0 && (cmp->cond == Cond::Gt || cmp->cond == Cond::Ge)) {
+      if (!bound) return cmp->cond == Cond::Gt && iv->step == -1;
+      return int64_t(bound->v) + (cmp->cond == Cond::Gt) + iv->step >= INT32_MIN;
+    }
+    return false;
+  }
+
+  static bool offsetFits(const Cand &cd, const RangeAnalysis &ranges, int64_t c,
+                         const Range *ivRange = nullptr) {
+    Range i = ivRange ? *ivRange : ranges.rangeOfValue(cd.iv->phi);
+    Range k = cd.dynK ? ranges.rangeOfValue(cd.dynK) : Range{0, 0};
+    k.lo += cd.k; k.hi += cd.k;
+    Range j = cd.inv ? ranges.rangeOfValue(cd.inv) : Range{0, 0};
+    __int128 products[] = {(__int128)i.lo*k.lo, (__int128)i.lo*k.hi,
+                           (__int128)i.hi*k.lo, (__int128)i.hi*k.hi};
+    auto bounds = std::minmax_element(std::begin(products), std::end(products));
+    __int128 d0 = (__int128)k.lo * cd.iv->step, d1 = (__int128)k.hi * cd.iv->step;
+    return k.lo >= INT32_MIN && k.hi <= INT32_MAX &&
+           std::min(d0, d1) >= INT32_MIN && std::max(d0, d1) <= INT32_MAX &&
+           *bounds.first + j.lo + c >= INT32_MIN &&
+           *bounds.second + j.hi + c <= INT32_MAX;
+  }
+
+  // A wrapping signed offset jumps at least 2^31 bytes when the byte step
+  // fits i32. Two consecutive accesses to the same object smaller than that
+  // cannot both be valid across that jump. An unconditional access on every
+  // back-edge path therefore proves recurrence equivalence for defined
+  // executions, even when the input trip bound has no static interval.
+  bool objectProvesNoWrap(const Cand &cd, Function &f,
+                                const std::unordered_map<const Instruction *, size_t> &blockOf,
+                                const std::vector<std::vector<uint8_t>> &dom) {
+    AddrInfo root = addressOf(cd.base);
+    auto extent = objectBounds_.find(root.root);
+    if (extent == objectBounds_.end()) return false;
+    int64_t bytes = extent->second;
+    if (bytes <= 0 || bytes > INT32_MAX) return false;
+    // The increment is computed with word arithmetic too. Its actual
+    // sign-extended value is always i32, even for a runtime coefficient.
+    return memoryAccessEveryBackedge(cd, f, blockOf, dom);
+  }
+
+  static bool memoryAccessEveryBackedge(const Cand &cd, Function &f,
+                                      const std::unordered_map<const Instruction *, size_t> &blockOf,
+                                      const std::vector<std::vector<uint8_t>> &dom) {
+    for (auto &bb : f.blocks) for (auto &u : bb->instrs) {
+      bool memory = (u->op == Op::Load && !u->ops.empty() && u->ops[0] == cd.gep) ||
+                    (u->op == Op::Store && u->ops.size() == 2 && u->ops[1] == cd.gep);
+      if (!memory) continue;
+      size_t use = blockOf.at(u.get());
+      if (std::all_of(cd.iv->latches.begin(), cd.iv->latches.end(),
+                      [&](size_t latch) { return dom[latch][use] != 0; })) return true;
+    }
+    return false;
+  }
+
+  static bool memoryOnly(Instruction *gep, Function &f) {
+    for (auto &bb : f.blocks) for (auto &u : bb->instrs)
+      for (size_t k = 0; k < u->ops.size(); ++k)
+        if (u->ops[k] == gep && !((u->op == Op::Load && k == 0) ||
+                                  (u->op == Op::Store && k == 1))) return false;
+    return true;
+  }
+
+  // Replace a test-only counter with a pointer end test. Equality avoids any
+  // assumptions about the signed ordering of object addresses. Constant
+  // trips round the endpoint to the first failing IV, including step > 1.
+  // Runtime unit trips clamp empty domains so the first test remains false.
+  void replaceLoopTest(Rewriter &rw, Module &mod, Function &f, const Cand &cd,
+                       int64_t c0, Instruction *pointer, const RangeAnalysis &ranges) {
+    const IV &iv = *cd.iv;
+    if (cd.dynK || cd.k == 0 || !offsetFits(cd, ranges, c0)) return;
+    auto *br = f.blocks[iv.header]->instrs.back().get();
+    auto *cmp = dynamic_cast<Instruction *>(br->ops[0]);
+    if (!cmp || cmp->ops[0] != iv.phi || countUses(mod, cmp) != 1) return;
+    auto *initial = asConstInt(iv.init);
+    if (!initial) return;
+    // Only the update and test may still use the scalar IV. Ignore dead
+    // affine address trees: mark live operations from observable roots.
+    std::unordered_set<Instruction *> live;
+    std::function<void(Value *)> mark = [&](Value *v) {
+      auto *in = dynamic_cast<Instruction *>(v);
+      if (!in || !live.insert(in).second) return;
+      for (Value *o : in->ops) mark(o);
+    };
+    for (auto &b : f.blocks) for (auto &u : b->instrs)
+      if (!isPure(u->op)) mark(u.get());
+    std::unordered_set<Value *> updates;
+    for (size_t t = 0; t + 1 < iv.phi->ops.size(); t += 2)
+      if (iv.phi->ops[t] != f.blocks[iv.pre].get()) updates.insert(iv.phi->ops[t + 1]);
+    for (auto *in : live) for (Value *o : in->ops)
+      if (o == iv.phi && in != cmp && !updates.count(in)) return;
+    for (auto *in : live) for (Value *o : in->ops)
+      if (updates.count(o) && in != iv.phi) return;
+
+    Value *end = nullptr;
+    if (auto *bound = asConstInt(cmp->ops[1])) {
+      int64_t distance = iv.step > 0 ? int64_t(bound->v) - initial->v
+                                    : int64_t(initial->v) - bound->v;
+      distance += cmp->cond == Cond::Le || cmp->cond == Cond::Ge;
+      int64_t step = iv.step > 0 ? iv.step : -iv.step;
+      int64_t trips = distance > 0 ? (distance + step - 1) / step : 0;
+      int64_t endpoint = int64_t(initial->v) + trips * iv.step;
+      if (endpoint < INT32_MIN || endpoint > INT32_MAX) return;
+      Range r{endpoint, endpoint};
+      if (!offsetFits(cd, ranges, c0, &r)) return;
+      end = mod.constInt((int32_t)endpoint);
+    } else {
+      if ((iv.step != 1 || cmp->cond != Cond::Lt) &&
+          (iv.step != -1 || cmp->cond != Cond::Gt)) return;
+      Value *runtimeBound = rw.preOf(cmp->ops[1], iv.pre, 0);
+      if (!runtimeBound) return;
+      Range r = ranges.rangeOfValue(cmp->ops[1]);
+      r.lo = std::min<int64_t>(r.lo, initial->v);
+      r.hi = std::max<int64_t>(r.hi, initial->v);
+      if (!offsetFits(cd, ranges, c0, &r)) return;
+      auto test = std::make_unique<Instruction>(Op::ICmp, Type::I32);
+      test->cond = iv.step > 0 ? Cond::Gt : Cond::Lt;
+      test->ops = {runtimeBound, iv.init}; Value *t = test.get();
+      rw.insertPre(std::move(test), iv.pre);
+      auto select = std::make_unique<Instruction>(Op::Select, Type::I32);
+      select->ops = {t, runtimeBound, iv.init}; end = select.get();
+      rw.insertPre(std::move(select), iv.pre);
+    }
+    Value *off = cd.k == 1 ? end : rw.invMulC(end, cd.k, iv.pre);
+    off = rw.invAdd(off, cd.inv, iv.pre);
+    off = rw.withConstant(off, c0, iv.pre);
+    auto gep = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
+    gep->ops = {cd.base, off}; Value *limit = gep.get();
+    rw.insertPre(std::move(gep), iv.pre);
+    cmp->ops = {pointer, limit}; cmp->cond = Cond::Ne;
+  }
+
+  // Run only after all candidates are rewritten: candidate pointers remain
+  // valid throughout group processing even when their old address trees die.
+  void retireDeadRecurrences(Rewriter &rw, Function &f) {
+    std::unordered_set<Instruction *> live;
+    std::function<void(Value *)> mark = [&](Value *v) {
+      auto *in = dynamic_cast<Instruction *>(v);
+      if (!in || !live.insert(in).second) return;
+      for (Value *o : in->ops) mark(o);
+    };
+    // Cyclic phi/update pairs are not removed by a simple zero-use DCE.
+    for (auto &b : f.blocks) for (auto &u : b->instrs)
+      if (!isPure(u->op)) mark(u.get());
+    for (auto &b : f.blocks) {
+      auto &v = b->instrs;
+      v.erase(std::remove_if(v.begin(), v.end(), [&](auto &u) {
+        if (!isPure(u->op) || live.count(u.get())) return false;
+        rw.blockOf.erase(u.get()); objectBounds_.erase(u.get()); return true;
+      }), v.end());
+    }
+  }
+
   // Materialise the strength-reduced pointer for one derived address:
   //   preheader: p_init = gep base, (init*K + inv + c0)
   //   header:    p      = phi [pre: p_init], [latch: p_next]
@@ -658,10 +975,12 @@ private:
   // remainder is re-added per candidate as a gep displacement at the use site
   // (see the caller for why c0 is not always 0).
   Instruction *buildPointer(Rewriter &rw, Module &mod, Function &f,
-                            const Cand &cd, int64_t c0 = 0) {
+                            const Cand &cd, int64_t c0 = 0, bool pointer = true) {
     const IV &iv = *cd.iv;
     int64_t delta = 0;
-    if (!mulFits(cd.k, iv.step, delta)) return nullptr;
+    if (!mulFits(cd.k, iv.step, delta)) {
+      delta = int32_t(uint32_t(cd.k * iv.step));
+    }
 
     BasicBlock *preB = f.blocks[iv.pre].get();
     BasicBlock *headB = f.blocks[iv.header].get();
@@ -694,13 +1013,15 @@ private:
       off = ad.get();
       preOps.push_back(std::move(ad));
     }
-    auto pinit = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
-    pinit->ops = {cd.base, off};
-    Instruction *pInit = pinit.get();
-    preOps.push_back(std::move(pinit));
+    Value *pInit = off;
+    if (pointer) {
+      auto pinit = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
+      pinit->ops = {cd.base, off}; pInit = pinit.get();
+      preOps.push_back(std::move(pinit));
+    }
 
     // header: the pointer phi, kept with the block's other phis
-    auto pphi = std::make_unique<Instruction>(Op::Phi, Type::Ptr);
+    auto pphi = std::make_unique<Instruction>(Op::Phi, pointer ? Type::Ptr : Type::I32);
     Instruction *p = pphi.get();
 
     // splice the preheader ops in before its terminator
@@ -718,11 +1039,16 @@ private:
     while (hAt < hv.size() && hv[hAt]->op == Op::Phi) ++hAt;
     hv.insert(hv.begin() + (long)hAt, std::move(pphi));
     rw.blockOf[p] = iv.header;
+    if (pointer) {
+      auto extent = objectBounds_.find(addressOf(cd.base).root);
+      if (extent != objectBounds_.end()) objectBounds_[p] = extent->second;
+    }
 
     p->ops = {(Value *)preB, pInit};
     for (size_t latch : iv.latches) {
       BasicBlock *latchB = f.blocks[latch].get();
-      auto pnext = std::make_unique<Instruction>(Op::Gep, Type::Ptr);
+      auto pnext = std::make_unique<Instruction>(pointer ? Op::Gep : Op::Add,
+                                                  pointer ? Type::Ptr : Type::I32);
       pnext->ops = {p, increment};
       Instruction *pNext = pnext.get();
       p->ops.insert(p->ops.end(), {(Value *)latchB, pNext});

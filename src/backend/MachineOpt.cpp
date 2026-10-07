@@ -45,7 +45,6 @@ static void usesOf(const MInst &m, std::vector<int> &out) {
   OpSlots s = slots(m);
   for (int i = 0; i < 3; ++i)
     if (s.use[i] >= 0) out.push_back(s.use[i]);
-  if (m.op == MOp::Ret && m.a >= 0) out.push_back(m.a);
   if (m.op == MOp::Call)
     for (const MArg &a : m.args) out.push_back(a.vreg);
 }
@@ -199,7 +198,8 @@ size_t zeroFillFn(MachineFunc &f) {
 // ---------------------------------------------------------------------------
 
 size_t peepholeBlock(MBlock &blk,
-                     const std::unordered_map<int, int> &uses) {
+                     const std::unordered_map<int, int> &uses,
+                     const std::unordered_set<int> &wordRegs) {
   std::vector<MInst> &v = blk.instrs;
   std::vector<MInst> out;
   out.reserve(v.size());
@@ -217,7 +217,8 @@ size_t peepholeBlock(MBlock &blk,
       keep = false;
     }
     // x + 0 / x ^ 0 become plain moves
-    else if ((m.op == MOp::IAddI || m.op == MOp::IXorI) && m.imm == 0 &&
+    else if ((m.op == MOp::IXorI || (m.op == MOp::IAddI &&
+              (m.ty == Type::Ptr || wordRegs.count(m.a)))) && m.imm == 0 &&
              m.dst >= 0) {
       if (m.dst == m.a) {
         keep = false; // x + 0 in place
@@ -379,8 +380,6 @@ static void bumpPhysReads(const MInst &m, std::vector<int> &rx,
     (f == RF_F ? rf : rx)[(size_t)r]++;
   };
   for (int k = 0; k < 3; ++k) bump(s.useFile[k], s.use[k]);
-  if (m.op == MOp::Ret && m.a >= 0)
-    bump(m.ty == Type::F32 ? RF_F : RF_X, m.a);
   if (m.op == MOp::Call)
     for (const MArg &a : m.args)
       bump(a.ty == Type::F32 ? RF_F : RF_X, a.vreg);
@@ -389,7 +388,6 @@ static void bumpPhysReads(const MInst &m, std::vector<int> &rx,
 // Does `next` fully redefine the move's destination (same file, no read of
 // it) so the move can never be observed?
 static bool nextRedefinesDst(const MInst &mv, const MInst &next) {
-  if (isMoveF(mv) != isMoveF(next)) return false; // file mismatch
   // never delete across a call: its dst register is shared, and it may read
   // the value through an argument slot.
   if (next.op == MOp::Call || next.op == MOp::Ret || next.op == MOp::Jmp ||
@@ -436,13 +434,16 @@ size_t postPeepholeBlock(MBlock &blk, const std::vector<int> &rx,
           v.erase(v.begin() + (long)i);
           removed = true;
         } else if (i + 1 < v.size() && isValueStoreOp(v[i + 1].op) &&
-                   isMoveF(v[i + 1]) == isMoveF(m)) {
+                   slots(v[i + 1]).useFile[0] == (isMoveF(m) ? RF_F : RF_X)) {
           // mv rd,rs ; store rd, ... : when rd has *no other reader* in the
           // whole function than this store, the store can take rs directly.
           // The check uses the initial function-wide read counts (deletions
           // can only shrink real counts, so this is conservative, never
           // unsafe).  The store reads rd as its value operand (`a`); if rd is
           // also its address base (`b`) the count below would already be >=2.
+          // Use the store's operand file, not isMoveF(store): a store is not
+          // a MoveF even when its value is floating. Xn and Fn may have the
+          // same number while containing unrelated values (or an address).
           const std::vector<int> &reads = isMoveF(m) ? rf : rx;
           MInst &st = v[i + 1];
           if (st.a == m.dst && m.a >= 1 && m.a < 32 &&
@@ -451,7 +452,7 @@ size_t postPeepholeBlock(MBlock &blk, const std::vector<int> &rx,
             v.erase(v.begin() + (long)i);
             removed = true;
           }
-        } else if (i >= 1 && [&]() -> bool {
+        } else if (i >= 1 && (removed = [&]() -> bool {
           // Loop-latch (or phi-arm) copies:  ...; op (dst=rs); mv rd, rs; ...
           // When rs is read nowhere but this move, the move is pure renaming:
           // point the earlier definition at rd instead.  Safe because nothing
@@ -477,7 +478,7 @@ size_t postPeepholeBlock(MBlock &blk, const std::vector<int> &rx,
           p.dst = m.dst; // rename the definition to skip the move
           v.erase(v.begin() + (long)i);
           return true;
-        }()) {
+        }())) {
         }
       } // if (isMoveOp(...)) chain
       if (removed) {
@@ -490,6 +491,91 @@ size_t postPeepholeBlock(MBlock &blk, const std::vector<int> &rx,
     }
   }
   return gone;
+}
+
+// Propagate copies only inside their block, with explicit invalidation for
+// non-SSA phi copies. Confined destinations avoid extending two independent
+// live ranges into successor blocks. Calls use virtual operands here, so the
+// allocator still sees every value that must survive the call.
+static size_t propagateCopies(MachineFunc &f) {
+  std::unordered_map<int, size_t> useBlock;
+  std::unordered_map<int, int> defs;
+  std::unordered_set<int> nonlocal;
+  for (size_t b = 0; b < f.blocks.size(); ++b)
+    for (const auto &m : f.blocks[b].instrs) {
+      if (m.dst >= 0) ++defs[m.dst];
+      std::vector<int> reads; usesOf(m, reads);
+      for (int r : reads) {
+        auto it = useBlock.emplace(r, b);
+        if (!it.second && it.first->second != b) nonlocal.insert(r);
+      }
+    }
+  size_t changed = 0;
+  for (size_t b = 0; b < f.blocks.size(); ++b) {
+    std::unordered_map<int, int> copies;
+    for (auto &m : f.blocks[b].instrs) {
+      OpSlots sl = slots(m);
+      auto rewrite = [&](int &r) {
+        auto it = copies.find(r);
+        if (it != copies.end() && r != it->second) { r = it->second; ++changed; }
+      };
+      if (sl.use[0] >= 0) rewrite(m.a);
+      if (sl.use[1] >= 0) rewrite(m.b);
+      if (m.op == MOp::Ret) rewrite(m.a);
+      for (auto &arg : m.args) rewrite(arg.vreg);
+      if (sl.def >= 0) {
+        for (auto it = copies.begin(); it != copies.end();)
+          if (it->first == sl.def || it->second == sl.def) it = copies.erase(it);
+          else ++it;
+      }
+      if ((m.op == MOp::MoveX || m.op == MOp::MoveF) && m.a >= 0 &&
+          defs[m.dst] == 1 && !nonlocal.count(m.dst) && useBlock[m.dst] == b)
+        copies[m.dst] = m.a;
+    }
+  }
+  return changed;
+}
+
+// In word arithmetic (x << k) + c == (x + c/2^k) << k modulo 2^32.
+// Reuse an already available (x + c/2^k); do not introduce a new temporary.
+// This removes the add from neighbouring scaled offsets such as i*4-4.
+static size_t reuseScaledOffsets(MachineFunc &f) {
+  size_t changed = 0;
+  std::unordered_map<int, int> uses;
+  for (const auto &b : f.blocks) for (const auto &m : b.instrs) {
+    std::vector<int> rs; usesOf(m, rs); for (int r : rs) ++uses[r];
+  }
+  for (auto &b : f.blocks) {
+    std::unordered_map<int, MInst> available;
+    for (auto &m : b.instrs) {
+      if (m.op == MOp::IAddI && m.ty == Type::I32 && available.count(m.a)) {
+        const auto shift = available.at(m.a);
+        if (shift.op == MOp::SllI && shift.imm > 0 && shift.imm < 31 &&
+            uses[m.a] == 1 && int64_t(m.imm) % (int64_t(1) << shift.imm) == 0) {
+          int small = int64_t(m.imm) / (int64_t(1) << shift.imm);
+          for (const auto &entry : available) {
+            const auto &add = entry.second;
+            if (add.op != MOp::IAddI || add.ty != Type::I32 ||
+                add.a != shift.a || add.imm != small) continue;
+            m.op = MOp::SllI; m.a = entry.first; m.imm = shift.imm;
+            ++changed; break;
+          }
+        }
+      }
+      OpSlots s = slots(m);
+      if (s.def >= 0) {
+        for (auto it = available.begin(); it != available.end();) {
+          OpSlots old = slots(it->second);
+          bool kill = it->first == s.def;
+          for (int r : old.use) kill |= r == s.def;
+          if (kill) it = available.erase(it); else ++it;
+        }
+        if ((m.op == MOp::SllI || m.op == MOp::IAddI) && m.dst != m.a)
+          available[m.dst] = m;
+      }
+    }
+  }
+  return changed;
 }
 
 } // namespace
@@ -2069,7 +2155,7 @@ static Cond invertCond(Cond c) {
 
 // Does `p` fall through into the block that physically follows it?  An empty
 // block, a block whose last instruction is not a branch, and a block ending in
-// a conditional branch all fall through; `j` / `ret` / a compare-branch do not.
+// a conditional branch all fall through; only `j` and `ret` stop fall-through.
 static bool blockFallsThrough(const MachineFunc &f, int p) {
   const std::vector<MInst> &v = f.blocks[(size_t)p].instrs;
   if (v.empty()) return true;
@@ -2229,6 +2315,185 @@ size_t MachineOptimizer::strengthReduction(std::vector<MachineFunc> &fns) {
   return total;
 }
 
+// Greedily join high-weight CFG edges into disjoint layout chains. Unlike the
+// mid-end order, physical-register MIR can place a use before its definition
+// in the file: execution still follows the same CFG. No block can move across
+// an implicit edge here; the caller has already materialized all fall-throughs.
+static void placeMachineBlocks(MachineFunc &f) {
+  const int n = (int)f.blocks.size();
+  if (n < 3 || n > 2048 || blockFallsThrough(f, n - 1)) return;
+  const auto cfg = buildCfg(f);
+  const auto dom = computeDom(cfg, n);
+  std::vector<int> depth(n, 0), calls(n, 0);
+  for (int h = 0; h < n; ++h) {
+    bool loop = false;
+    for (int p : cfg.pred[h]) loop |= dom[p][h];
+    if (!loop) continue;
+    const auto members = collectLoopNodes(cfg, n, h, dom);
+    for (int i = 0; i < n; ++i) depth[i] += members[i];
+  }
+  std::unordered_map<std::string, int> labels;
+  for (int i = 0; i < n; ++i) {
+    labels[f.blocks[i].name] = i;
+    for (const auto &m : f.blocks[i].instrs) calls[i] += m.op == MOp::Call;
+  }
+  auto frequency = [&](int i) { return uint64_t(1) << std::min(3 * depth[i], 24); };
+  auto probability = [&](int from, int to) {
+    if (cfg.succ[from].size() == 1) return 100;
+    bool exit = false;
+    for (int s : cfg.succ[from]) exit |= depth[s] < depth[from];
+    return exit ? (depth[to] < depth[from] ? 10 : 90) : 50;
+  };
+  struct Edge { int from, to; uint64_t weight; };
+  std::vector<Edge> edges;
+  for (int i = 0; i < n; ++i) for (int s : cfg.succ[i]) {
+    if (s == 0 || s == i) continue;
+    const uint64_t tie = (s == i + 1 ? 4 : 0) + std::min(2, calls[i] + calls[s]);
+    edges.push_back({i, s, frequency(i) * probability(i, s) * 16 + tie});
+  }
+  std::stable_sort(edges.begin(), edges.end(), [](const Edge &a, const Edge &b) {
+    return a.weight > b.weight;
+  });
+  std::vector<std::vector<int>> chains(n);
+  std::vector<int> owner(n);
+  for (int i = 0; i < n; ++i) { chains[i].push_back(i); owner[i] = i; }
+  for (const auto &edge : edges) {
+    const int a = owner[edge.from], b = owner[edge.to];
+    if (a == b || chains[a].back() != edge.from || chains[b].front() != edge.to) continue;
+    for (int block : chains[b]) { chains[a].push_back(block); owner[block] = a; }
+    chains[b].clear();
+  }
+  std::vector<int> order;
+  std::vector<char> placed(n, 0);
+  int chain = owner[0];
+  while ((int)order.size() < n) {
+    for (int block : chains[chain]) order.push_back(block);
+    placed[chain] = 1;
+    int next = -1;
+    // Continue with a connected remaining chain when possible, otherwise keep
+    // the original order of disconnected/cold chains for deterministic ties.
+    for (const auto &edge : edges)
+      if (edge.from == order.back() && !placed[owner[edge.to]] &&
+          chains[owner[edge.to]].front() == edge.to) { next = owner[edge.to]; break; }
+    if (next < 0)
+      for (int i = 0; i < n; ++i)
+        if (!placed[owner[i]]) { next = owner[i]; break; }
+    if (next < 0) break;
+    chain = next;
+  }
+  auto cost = [&](const std::vector<int> &layout) {
+    uint64_t weighted = 0;
+    size_t jumps = 0;
+    for (int p = 0; p < n; ++p) {
+      const int i = layout[p], next = p + 1 < n ? layout[p + 1] : -1;
+      const auto &code = f.blocks[i].instrs;
+      if (code.empty() || code.back().op != MOp::Jmp) continue;
+      const int target = labels.at(code.back().sym);
+      if (target == next) continue;
+      bool conditional = code.size() >= 2 && isCondBranchOp(code[code.size() - 2].op);
+      if (conditional && labels.at(code[code.size() - 2].sym) == next) continue;
+      ++jumps;
+      weighted += frequency(i) * (conditional ? probability(i, target) : 100);
+    }
+    return std::make_pair(weighted, jumps);
+  };
+  std::vector<int> original(n);
+  for (int i = 0; i < n; ++i) original[i] = i;
+  const auto before = cost(original), after = cost(order);
+  // Estimates are not a profile. Require a strict cost improvement and no
+  // static jump increase before accepting the candidate; keep a good existing
+  // loop rotation when the greedy chains cannot improve it.
+  if (after.first >= before.first || after.second > before.second) return;
+  std::vector<MBlock> reordered;
+  reordered.reserve(n);
+  for (int i : order) reordered.push_back(std::move(f.blocks[i]));
+  f.blocks = std::move(reordered);
+}
+
+// Final branch folding after layout/rotation. Keep every fall-through explicit
+// while deleting or joining blocks; otherwise erasing a block can silently
+// redirect its physical predecessor. Registers and instructions inside a
+// joined block keep their order, so this is also safe after allocation.
+static size_t finalizeBlockLayoutFn(MachineFunc &f) {
+  auto branchCount = [&]() {
+    size_t count = 0;
+    for (const auto &b : f.blocks) for (const auto &m : b.instrs)
+      count += m.op == MOp::Jmp || isCondBranchOp(m.op);
+    return count;
+  };
+  const size_t before = branchCount();
+  for (size_t i = 0; i + 1 < f.blocks.size(); ++i)
+    if (blockFallsThrough(f, (int)i)) {
+      MInst jump; jump.op = MOp::Jmp; jump.sym = f.blocks[i + 1].name;
+      f.blocks[i].instrs.push_back(std::move(jump));
+    }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    // Forward branch-only blocks, including the empty blocks normalized above.
+    // A self-loop is observable (it does not terminate), so never erase it.
+    for (size_t i = 1; i < f.blocks.size(); ++i) {
+      const auto &b = f.blocks[i];
+      if (b.instrs.size() != 1 || b.instrs[0].op != MOp::Jmp ||
+          b.instrs[0].sym == b.name) continue;
+      const auto name = b.name, target = b.instrs[0].sym;
+      for (auto &pred : f.blocks) for (auto &m : pred.instrs)
+        if ((m.op == MOp::Jmp || isCondBranchOp(m.op)) && m.sym == name)
+          m.sym = target;
+      f.blocks.erase(f.blocks.begin() + i);
+      changed = true;
+      break;
+    }
+    if (changed) continue;
+
+    const auto cfg = buildCfg(f);
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < f.blocks.size(); ++i) labels[f.blocks[i].name] = i;
+    for (size_t i = 0; i < f.blocks.size(); ++i) {
+      auto &code = f.blocks[i].instrs;
+      if (code.empty() || code.back().op != MOp::Jmp ||
+          (code.size() > 1 && isTerminatorOp(code[code.size() - 2].op))) continue;
+      auto target = labels.find(code.back().sym);
+      if (target == labels.end()) continue;
+      const size_t j = target->second;
+      if (j == 0 || j == i || cfg.pred[j].size() != 1 || cfg.pred[j][0] != (int)i)
+        continue;
+      // Join a single-successor/single-predecessor chain even when the earlier
+      // layout separated it. This also combines update + latch-test blocks.
+      code.pop_back();
+      const auto &tail = f.blocks[j].instrs;
+      code.insert(code.end(), tail.begin(), tail.end());
+      f.blocks.erase(f.blocks.begin() + j);
+      changed = true;
+      break;
+    }
+  }
+
+  if (!std::getenv("SAKU_NO_MACHINE_PLACE")) placeMachineBlocks(f);
+  for (size_t i = 0; i < f.blocks.size(); ++i) {
+    auto &code = f.blocks[i].instrs;
+    if (code.empty() || code.back().op != MOp::Jmp) continue;
+    const std::string next = i + 1 < f.blocks.size() ? f.blocks[i + 1].name : "";
+    if (code.size() >= 2 && isCondBranchOp(code[code.size() - 2].op)) {
+      auto &branch = code[code.size() - 2];
+      if (branch.sym == code.back().sym) {
+        // Both outcomes have the same successor: no condition is required.
+        code.erase(code.end() - 2);
+      } else if (branch.sym == next) {
+        branch.sym = code.back().sym;
+        if (branch.op == MOp::BrCmp) branch.imm = (int64_t)invertCond((Cond)branch.imm);
+        else branch.op = branch.op == MOp::BrZ ? MOp::BrNz : MOp::BrZ;
+        code.pop_back();
+        continue;
+      }
+    }
+    if (code.back().sym == next) code.pop_back();
+  }
+  const size_t after = branchCount();
+  return before > after ? before - after : 0;
+}
+
 size_t MachineOptimizer::zeroFill(std::vector<MachineFunc> &fns) {
   size_t total = 0;
   for (MachineFunc &f : fns) total += zeroFillFn(f);
@@ -2238,6 +2503,20 @@ size_t MachineOptimizer::zeroFill(std::vector<MachineFunc> &fns) {
 size_t MachineOptimizer::peephole(std::vector<MachineFunc> &fns) {
   size_t p = 0;
   for (MachineFunc &f : fns) {
+    if (!std::getenv("SAKU_NO_COPY_PROP")) p += propagateCopies(f);
+    if (!std::getenv("SAKU_NO_SCALE_REUSE")) p += reuseScaledOffsets(f);
+    std::unordered_set<int> wordRegs;
+    std::unordered_set<int> wideRegs;
+    for (const auto &b : f.blocks) for (const auto &m : b.instrs) {
+      if (m.dst < 0 || slots(m).defFile != RF_X) continue;
+      bool word = m.op == MOp::Li || m.op == MOp::Lw || m.op == MOp::LwF ||
+        m.op == MOp::LwG || m.op == MOp::SllI || m.op == MOp::SrlI || m.op == MOp::SraI ||
+        m.op == MOp::IMul || m.op == MOp::IDiv || m.op == MOp::IRem ||
+        m.op == MOp::ISub || m.op == MOp::INeg || m.op == MOp::F2I ||
+        ((m.op == MOp::IAdd || m.op == MOp::IAddI) && m.ty == Type::I32);
+      if (word) wordRegs.insert(m.dst); else wideRegs.insert(m.dst);
+    }
+    for (int r : wideRegs) wordRegs.erase(r);
     // function-wide use counts first, so a pure definition is only removed
     // when no block anywhere reads it.
     std::unordered_map<int, int> uses;
@@ -2250,7 +2529,7 @@ size_t MachineOptimizer::peephole(std::vector<MachineFunc> &fns) {
     for (const MBlock &blk : f.blocks)
       for (const MInst &m : blk.instrs) bump(m);
 
-    for (MBlock &blk : f.blocks) p += peepholeBlock(blk, uses);
+    for (MBlock &blk : f.blocks) p += peepholeBlock(blk, uses, wordRegs);
   }
   return p;
 }
@@ -2349,6 +2628,19 @@ size_t MachineOptimizer::removeRedundantMoves(std::vector<MachineFunc> &fns) {
 size_t MachineOptimizer::rotateLoopsByLayout(std::vector<MachineFunc> &fns) {
   size_t total = 0;
   for (MachineFunc &f : fns) total += rotateLoopsByLayoutFn(f);
+  return total;
+}
+
+size_t MachineOptimizer::finalizeBlockLayout(std::vector<MachineFunc> &fns) {
+  size_t total = 0;
+  for (MachineFunc &f : fns) {
+    size_t oldBlocks, removed;
+    do {
+      oldBlocks = f.blocks.size();
+      removed = finalizeBlockLayoutFn(f);
+      total += removed;
+    } while (removed || f.blocks.size() != oldBlocks);
+  }
   return total;
 }
 

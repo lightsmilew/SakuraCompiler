@@ -34,11 +34,11 @@ the reference `libsysy_riscv.a`):
 | `cases/performance2026`|   60 | 100% passing  |
 | `cases/tensor`        |    25 | 100% passing (TensorType extension) |
 
-The [performance2026 register-pressure analysis](docs/performance2026-register-pressure.md)
+The [performance2026 register-pressure analysis](results/performance2026/performance2026-register-pressure.md)
 documents LLVM comparisons, spill diagnostics and repeatable timing with
-`tools/benchmark.py` on an already running VM.
+`tools/benchmark/benchmark.py` on an already running VM.
 
-The [LLVM follow-up analysis](docs/performance2026-llvm-followup.md) covers
+The [LLVM follow-up analysis](results/performance2026/performance2026-llvm-followup.md) covers
 constant-argument dispatch specialization, comparison-branch fusion, cheaper
 non-negative division, and regression fixes for remainder tests, range guards
 promoted-phi lifetime, and conditional phi-edge copies.
@@ -48,8 +48,8 @@ promoted-phi lifetime, and conditional phi-edge copies.
 ## 1. Quick start
 
 ```bash
-./scripts/build.sh                            # build the compiler
-./scripts/compile_dir.sh cases/functional -o /tmp/out     # compile a suite to asm
+./tools/build/build.sh                            # build the compiler
+./tools/compile/compile_dir.sh cases/functional -o /tmp/out     # compile a suite to asm
 ./build/compiler cases/functional/00_main.sy -S           # single file -> stdout
 
 # one-off mid-end IR views
@@ -58,7 +58,7 @@ promoted-phi lifetime, and conditional phi-edge copies.
 ./build/compiler in.sy --dump-cf  -o /dev/null > in.cf.mlir
 
 # end-to-end correctness on the QEMU VM (must be running, see §6)
-./scripts/test.sh
+./tools/test/test.sh
 ```
 
 ## 2. Build
@@ -68,11 +68,11 @@ under `3rd_party/`, so nothing is downloaded.
 
 | command | effect |
 |---|---|
-| `./scripts/build.sh` | configure + incremental build |
-| `./scripts/build.sh clean` | wipe `build/` and rebuild from scratch |
+| `./tools/build/build.sh` | configure + incremental build |
+| `./tools/build/build.sh clean` | wipe `build/` and rebuild from scratch |
 | `cmake --build build -j$(nproc)` | incremental rebuild of an existing tree |
 
-The driver is produced at `build/compiler`.  `scripts/build.sh` honours the
+The driver is produced at `build/compiler`.  `tools/build/build.sh` honours the
 `BUILD_DIR` and `JOBS` environment variables.
 
 ## 3. Command line
@@ -165,17 +165,17 @@ cf.br ^bb1
 
 | script | purpose |
 |---|---|
-| `scripts/build.sh` | build (or clean-rebuild) the compiler. |
-| `scripts/compile_dir.sh` | batch-compile every `.sy` in a directory, emitting assembly **or** an affine/scf/cf/final IR dump per file. |
-| `scripts/run.sh` | legacy helper: `-build`, `-rebuild`, `-S file.sy`, `-qemu-test [suite...]`. |
-| `scripts/test.sh` | build + end-to-end QEMU correctness gate over the suites. |
-| `tools/qemu_verify.sh` | host side of the correctness gate (compile, push to VM, cache bookkeeping). |
-| `tools/guest_test.sh` | guest side of the correctness gate (as + link + run + diff). |
+| `tools/build/build.sh` | build (or clean-rebuild) the compiler. |
+| `tools/compile/compile_dir.sh` | batch-compile every `.sy` in a directory, emitting assembly **or** an affine/scf/cf/final IR dump per file. |
+| `tools/compile/run.sh` | legacy helper: `-build`, `-rebuild`, `-S file.sy`, `-qemu-test [suite...]`. |
+| `tools/test/test.sh` | build + end-to-end QEMU correctness gate over the suites. |
+| `tools/test/qemu_verify.sh` | host side of the correctness gate (compile, push to VM, cache bookkeeping). |
+| `tools/test/guest_test.sh` | guest side of the correctness gate (as + link + run + diff). |
 
-### 4.1 `scripts/compile_dir.sh`
+### 4.1 `tools/compile/compile_dir.sh`
 
 ```
-./scripts/compile_dir.sh DIR... -o OUTDIR [MODE] [compiler flags]
+./tools/compile/compile_dir.sh DIR... -o OUTDIR [MODE] [compiler flags]
 ```
 
 Modes (exactly one, default `--asm`):
@@ -195,10 +195,10 @@ files.  Compiler flags (`-O0/-O1/-O2`, …) may be given anywhere and are
 forwarded; IR-dump modes discard the always-generated assembly.
 
 ```bash
-./scripts/compile_dir.sh cases/functional -o /tmp/out            # 100 .s files
-./scripts/compile_dir.sh cases/tensor cases/h_functional \
+./tools/compile/compile_dir.sh cases/functional -o /tmp/out            # 100 .s files
+./tools/compile/compile_dir.sh cases/tensor cases/h_functional \
     -o /tmp/out --cf -O1                                          # cf IR at O1
-./scripts/compile_dir.sh cases/functional -o /tmp/out --asm -O0   # O0 assembly
+./tools/compile/compile_dir.sh cases/functional -o /tmp/out --asm -O0   # O0 assembly
 ```
 
 `JOBS` (parallelism, default nproc ≤ 16), `COMP` (compiler path),
@@ -273,15 +273,15 @@ links against `libsysy_riscv.a`, runs, and diffs stdout + exit code against
 the reference `.out`.
 
 Prerequisites: the VM is up and reachable at `ssh ubuntu@localhost:2222`
-(password is the `QEMU_PASS` default in `tools/qemu_verify.sh`); the guest has
+(password is the `QEMU_PASS` default in `tools/test/qemu_verify.sh`); the guest has
 the cross toolchain (`riscv64-linux-gnu-*`) and the reference runtime library
 at `~/libsysy_riscv.a` (or `~/riscv/libsysy_riscv.a`).
 
 ```bash
-./scripts/test.sh                          # build + functional + h_functional + performance2026
-./scripts/test.sh tensor                   # single suite
-./scripts/run.sh -qemu-test h_functional performance2026
-./tools/qemu_verify.sh functional h_functional performance2026 tensor
+./tools/test/test.sh                          # build + functional + h_functional + performance2026
+./tools/test/test.sh tensor                   # single suite
+./tools/compile/run.sh -qemu-test h_functional performance2026
+./tools/test/qemu_verify.sh functional h_functional performance2026 tensor
 ```
 
 **Verification cache.** Repeat runs are cheap: a case is re-run on the guest
@@ -327,6 +327,12 @@ assembly did not change are reported `CACHED` and skip the guest entirely.
 static CFG block placement. See [polyhedral and layout notes](docs/polyhedral-layout.md)
 and [index-set loop splitting](docs/loop-split.md) for supported domains, legality
 constraints, references, regression tests and A/B switches.
+Pointer recurrence sharing, exit tests and machine copy/offset folding are
+described in [pointer optimization notes](docs/pointer-strength-reduction.md).
+Tool entry points are grouped by function under [tools](tools/README.md);
+performance measurements and comparisons are kept under `results/`.
+The [pointer optimization comparison](results/pointer-strength-reduction/report.md)
+includes correctness gates, LLVM timings, focused rechecks and spill diagnostics.
 
 ```
 CMakeLists.txt                    build definition (ANTLR4 vendored as a subdir)
@@ -343,9 +349,16 @@ src/
   backend/                        ISel / MachineOpt / RA / Asm / Pipeline
   common/                         shared errors & helpers
 3rd_party/antlr4-runtime/         vendored ANTLR4 C++ runtime
-cases/                            functional, h_functional, performance2026, tensor
+cases/                            functional, h_functional, performance2026, tensor,
+                                  optimization, regression
 vm/                               QEMU guest disk image
 docs/architecture.md              deeper design notes
-scripts/                          build.sh, compile_dir.sh, run.sh, test.sh
-tools/                            qemu_verify.sh (host), guest_test.sh (guest)
+tools/
+  build/                          compiler builds
+  compile/                        batch compilation, driver and LLVM reference
+  test/                           host/guest correctness checks
+  benchmark/                      timing, diagnostics and comparison reports
+  frontend/                       parser generation dependencies
+  common/                         shared resource limits
+results/                          measurements and comparison reports
 ```

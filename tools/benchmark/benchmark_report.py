@@ -14,6 +14,8 @@ def main():
     parser.add_argument("--baseline", default="before")
     parser.add_argument("--out", type=pathlib.Path)
     args = parser.parse_args()
+    if args.out and pathlib.Path(__file__).resolve().parents[2] / 'docs' in args.out.resolve().parents:
+        parser.error('comparison results belong in results/ or build/, not docs/')
     rows = json.loads(args.summary.read_text())
     by_case = {}
     for row in rows:

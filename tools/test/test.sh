@@ -5,21 +5,20 @@
 # (QEMU) and diffs stdout+exit code against the reference .out files.
 #
 # Cases whose freshly-compiled assembly is byte-identical to the last verified
-# run are skipped on the guest (see tools/qemu_verify.sh, build/.verify_cache).
+# run are skipped on the guest (see tools/test/qemu_verify.sh, build/.verify_cache).
 #
-# Requires the VM to be up with ssh on localhost:2222 (see tools/qemu_verify.sh).
+# Requires the VM to be up with ssh on localhost:2222 (see tools/test/qemu_verify.sh).
 #
-#   ./scripts/test.sh [suite ...]     default: functional h_functional performance2026
+#   ./tools/test/test.sh [suite ...]     default: functional h_functional performance2026
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 echo "== build =="
-cmake -S . -B build >/dev/null
-cmake --build build -j"$(nproc 2>/dev/null || echo 4)" || exit 1
+bash "$ROOT/tools/build/build.sh" || exit 1
 
 suites=("$@")
 [ ${#suites[@]} -eq 0 ] && suites=(functional h_functional performance2026)
 
-./tools/qemu_verify.sh "${suites[@]}"
+./tools/test/qemu_verify.sh "${suites[@]}"

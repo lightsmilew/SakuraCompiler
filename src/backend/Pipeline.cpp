@@ -109,6 +109,9 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
   // still lose its unconditional back edge.  Disable with SAKU_NO_LAYOUT_ROTATE.
   if (opts.machineOpt && !std::getenv("SAKU_NO_LAYOUT_ROTATE"))
     rotated = opt_.rotateLoopsByLayout(fns);
+  size_t folded = 0;
+  if (opts.machineOpt && !std::getenv("SAKU_NO_BRANCH_FOLD"))
+    folded = opt_.finalizeBlockLayout(fns);
   dumpMir("SAKU_MIR_POST_LAYOUT", fns);
 
   if (opts.stats)
@@ -117,7 +120,7 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
                 << "backend-zerofill: " << zerofill
                 << " zero stores coalesced\n"
                 << "backend-peephole: " << peephole
-                << " instructions eliminated\n"
+                << " rewrites/deletions\n"
                 << "backend-schedule: " << scheduled << " loads hoisted\n"
                 << "backend-blockcse: " << blockcse
                 << " instructions eliminated\n"
@@ -131,10 +134,11 @@ std::string RISCVBackend::run(ir::Module *mod, const BackendOptions &opts) {
                 << "backend-postra-peephole: " << postra
                 << " moves removed\n"
                 << "backend-layout-rotate: " << rotated
-                << " loops rotated\n";
+                << " loops rotated\n"
+                << "backend-branch-fold: " << folded << " branches removed\n";
 
   // ---- 5) assembly emission ---------------------------------------------
-  return writer_.write(mod, fns);
+  return writer_.write(mod, fns, opts.stats);
 }
 
 } // namespace backend

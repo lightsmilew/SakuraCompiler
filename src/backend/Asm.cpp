@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
-#include <unordered_set>
+#include <unordered_map>
 
 using namespace sakura::ir;
 
@@ -25,7 +25,6 @@ std::string frn(int32_t r) { return fregName(r); }
 // ---------------------------------------------------------------------------
 // per-function frame layout (offsets measured from sp after the prologue)
 //   0 .. outMax                       outbound stack-argument area
-//   outMax .. + shuffleBytes          register-argument shuffle slots
 //   .. + spillCount*8                 spill slots
 //   .. + localBytes                   ISel-assigned locals
 //   .. + usedCSF*8                    saved float callee-saved registers
@@ -34,7 +33,6 @@ std::string frn(int32_t r) { return fregName(r); }
 // ---------------------------------------------------------------------------
 struct Frame {
   int64_t outMax = 0;
-  int64_t shuffleBytes = 0;
   int64_t spillBytes = 0;
   int64_t localBytes = 0;
   int64_t spillBase = 0;
@@ -52,39 +50,39 @@ struct ShuffleItem {
   int32_t tgt = -1; // required physical argument register
   int32_t src = -1; // current physical register of the value
   bool isF = false;
-  int32_t slot = -1; // assigned shuffle slot when the source must be saved
 };
 
-// Determine, for one call, which register args need copying and how many
-// shuffle memory slots are required.
-int planCall(const MInst &m, std::vector<ShuffleItem> &items) {
+// Serialize parallel ABI copies. A destination can be written as soon as no
+// pending copy still reads it. Only a true cycle needs a temporary, and the
+// allocator reserves t1/ft1 for exactly such late lowering operations.
+void planCall(const MInst &m, std::vector<ShuffleItem> &items) {
   items.clear();
+  std::vector<ShuffleItem> pending;
   ArgCursor c;
   for (auto &a : m.args) {
     ArgLoc loc = c.next(a.ty == Type::F32);
     if (a.vreg < 0) continue; // already stored on the stack
     if (loc.reg < 0) continue;
     if (loc.reg != a.vreg)
-      items.push_back(ShuffleItem{loc.reg, a.vreg, a.ty == Type::F32, -1});
+      pending.push_back(ShuffleItem{loc.reg, a.vreg, a.ty == Type::F32});
   }
-  // A source that sits in a register which is also a target of another pending
-  // argument will be clobbered; those need a memory slot.
-  std::unordered_set<int> tset;
-  for (auto &it : items) tset.insert((it.isF ? 1000 : 0) + it.tgt);
-  int slots = 0;
-  for (auto &it : items) {
-    if (tset.count((it.isF ? 1000 : 0) + it.src)) it.slot = slots++;
+  while (!pending.empty()) {
+    auto ready = std::find_if(pending.begin(), pending.end(), [&](const ShuffleItem &it) {
+      return std::none_of(pending.begin(), pending.end(), [&](const ShuffleItem &reader) {
+        return reader.isF == it.isF && reader.src == it.tgt;
+      });
+    });
+    if (ready != pending.end()) {
+      items.push_back(*ready);
+      pending.erase(ready);
+      continue;
+    }
+    const auto cycle = pending.front();
+    const int scratch = cycle.isF ? kScratchF2 : kScratchX2;
+    items.push_back({scratch, cycle.src, cycle.isF});
+    for (auto &it : pending)
+      if (it.isF == cycle.isF && it.src == cycle.src) it.src = scratch;
   }
-  return slots;
-}
-
-int maxShuffleNeeded(const MachineFunc &mf) {
-  int need = 0;
-  std::vector<ShuffleItem> items;
-  for (auto &b : mf.blocks)
-    for (auto &m : b.instrs)
-      if (m.op == MOp::Call) need = std::max(need, planCall(m, items));
-  return need;
 }
 
 Frame layoutFrame(const MachineFunc &mf) {
@@ -95,8 +93,7 @@ Frame layoutFrame(const MachineFunc &mf) {
   fr.localBytes = mf.localBytes;
   fr.xN = (int)mf.usedCSX.size() + (fr.saveRa ? 1 : 0);
   fr.fN = (int)mf.usedCSF.size();
-  fr.shuffleBytes = 8LL * maxShuffleNeeded(mf);
-  fr.spillBase = fr.outMax + fr.shuffleBytes;
+  fr.spillBase = fr.outMax;
   fr.localBase = fr.spillBase + fr.spillBytes;
   fr.fBase = fr.localBase + fr.localBytes;
   fr.xBase = fr.fBase + (int64_t)fr.fN * 8;
@@ -224,28 +221,9 @@ void emitEpilogue(std::ostringstream &os, const MachineFunc &mf,
 // ---------------------------------------------------------------------------
 // register-argument shuffle before a call
 // ---------------------------------------------------------------------------
-void emitCallShuffle(std::ostringstream &os, const MachineFunc &mf,
-                     const Frame &fr, const std::vector<ShuffleItem> &items) {
-  if (items.empty()) return;
-  // Phase 1: save sources that would be clobbered.
+void emitCallShuffle(std::ostringstream &os, const std::vector<ShuffleItem> &items) {
   for (auto &it : items) {
-    if (it.slot < 0 || it.src == it.tgt) continue; // self-copy needs no spill
-    int64_t off = fr.outMax + (int64_t)it.slot * 8;
-    if (it.isF)
-      emitMem(os, "fsw", frn(it.src), off, "sp");
-    else
-      emitMem(os, "sd", xrn(it.src), off, "sp");
-  }
-  // Phase 2: perform the copies.
-  for (auto &it : items) {
-    if (it.src == it.tgt) continue;
-    if (it.slot >= 0) {
-      int64_t off = fr.outMax + (int64_t)it.slot * 8;
-      if (it.isF)
-        emitMem(os, "flw", frn(it.tgt), off, "sp");
-      else
-        emitMem(os, "ld", xrn(it.tgt), off, "sp");
-    } else if (it.isF) {
+    if (it.isF) {
       os << "\tfmv.s " << frn(it.tgt) << ", " << frn(it.src) << "\n";
     } else {
       os << "\tmv " << xrn(it.tgt) << ", " << xrn(it.src) << "\n";
@@ -257,7 +235,7 @@ void emitCallShuffle(std::ostringstream &os, const MachineFunc &mf,
 // instruction selection -> assembly line
 // ---------------------------------------------------------------------------
 void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
-              const MInst &m) {
+              const MInst &m, const std::unordered_map<std::string, std::string> &labels) {
   using MOp_ = MOp;
   switch (m.op) {
   case MOp_::Prologue:
@@ -269,13 +247,13 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   case MOp_::Nop:
     return;
   case MOp_::Jmp:
-    os << "\tj " << m.sym << "\n";
+    os << "\tj " << labels.at(m.sym) << "\n";
     return;
   case MOp_::BrNz:
-    os << "\tbnez " << xrn(m.a) << ", " << m.sym << "\n";
+    os << "\tbnez " << xrn(m.a) << ", " << labels.at(m.sym) << "\n";
     return;
   case MOp_::BrZ:
-    os << "\tbeqz " << xrn(m.a) << ", " << m.sym << "\n";
+    os << "\tbeqz " << xrn(m.a) << ", " << labels.at(m.sym) << "\n";
     return;
   case MOp_::BrCmp: {
     const char *op = "beq";
@@ -288,10 +266,10 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
     default: op = "beq"; break;
     }
     if ((Cond)m.imm == Cond::Le || (Cond)m.imm == Cond::Gt) {
-      os << "\t" << op << " " << xrn(m.b) << ", " << xrn(m.a) << ", " << m.sym
+      os << "\t" << op << " " << xrn(m.b) << ", " << xrn(m.a) << ", " << labels.at(m.sym)
          << "\n";
     } else {
-      os << "\t" << op << " " << xrn(m.a) << ", " << xrn(m.b) << ", " << m.sym
+      os << "\t" << op << " " << xrn(m.a) << ", " << xrn(m.b) << ", " << labels.at(m.sym)
          << "\n";
     }
     return;
@@ -627,7 +605,7 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   case MOp_::Call: {
     std::vector<ShuffleItem> items;
     planCall(m, items);
-    emitCallShuffle(os, mf, fr, items);
+    emitCallShuffle(os, items);
     os << "\tcall " << m.sym << "\n";
     if (m.dst >= 0) {
       if (m.ty == Type::F32) {
@@ -641,13 +619,48 @@ void emitInst(std::ostringstream &os, const MachineFunc &mf, const Frame &fr,
   }
 }
 
-void emitFunction(std::ostringstream &os, const MachineFunc &mf) {
+// Attribute emitted same-file copies to their MIR origin. Cross-file bit
+// materialisation (fmv.w.x) is not a copy between interchangeable registers.
+void reportCopies(std::ostream &stats, const MachineFunc &mf, const Frame &fr) {
+  enum Origin { Mir, Entry, Argument, Result, Return, Address, Count };
+  const char *names[] = {"mir", "entry", "argument", "result", "return", "address"};
+  int counts[2][Count] = {};
+  for (const auto &b : mf.blocks)
+    for (const auto &m : b.instrs) {
+      if (m.op == MOp::MoveX || m.op == MOp::MoveF)
+        counts[m.op == MOp::MoveF][Mir] += m.dst != m.a;
+      if (m.op == MOp::EntryInt || m.op == MOp::EntryFlt)
+        counts[m.op == MOp::EntryFlt][Entry] += m.dst != m.imm;
+      if (m.op == MOp::Ret)
+        counts[m.ty == Type::F32][Return] += m.a >= 0 && m.a != 10;
+      if (m.op == MOp::Call) {
+        std::vector<ShuffleItem> items;
+        planCall(m, items);
+        for (const auto &it : items)
+          ++counts[it.isF][Argument];
+        counts[m.ty == Type::F32][Result] += m.dst >= 0 && m.dst != 10;
+      }
+      if (m.op == MOp::LeaFrame)
+        counts[0][Address] += !fits12(fr.localBase + m.imm);
+    }
+  stats << "backend-copies " << mf.name << ":";
+  for (int file = 0; file < 2; ++file)
+    for (int i = 0; i < Count; ++i)
+      stats << ' ' << (file ? "f-" : "x-") << names[i] << '=' << counts[file][i];
+  stats << " shuffle-stores=0 shuffle-loads=0\n";
+}
+
+void emitFunction(std::ostringstream &os, const MachineFunc &mf, std::ostream *stats,
+                  size_t &nextLabel) {
   Frame fr = layoutFrame(mf);
+  if (stats) reportCopies(*stats, mf, fr);
   os << "\n\t.text\n\t.p2align 2\n\t.globl " << mf.name << "\n";
   os << mf.name << ":\n";
+  std::unordered_map<std::string, std::string> labels;
+  for (const auto &b : mf.blocks) labels.emplace(b.name, ".L" + std::to_string(nextLabel++));
   for (auto &b : mf.blocks) {
-    os << b.name << ":\n";
-    for (auto &m : b.instrs) emitInst(os, mf, fr, m);
+    os << labels.at(b.name) << ":\n";
+    for (auto &m : b.instrs) emitInst(os, mf, fr, m, labels);
   }
 }
 
@@ -690,10 +703,12 @@ void emitGlobal(std::ostringstream &os, const GlobalVar &g) {
 
 } // namespace
 
-std::string AssemblyWriter::write(Module *mod, std::vector<MachineFunc> &fns) {
+std::string AssemblyWriter::write(Module *mod, std::vector<MachineFunc> &fns,
+                                 std::ostream *stats) {
   std::ostringstream os;
-  os << "\t.text\n";
-  for (auto &f : fns) emitFunction(os, f);
+  os << "# Generated by the Sakura compiler.\n\t.text\n";
+  size_t nextLabel = 0;
+  for (auto &f : fns) emitFunction(os, f, stats, nextLabel);
   for (auto &g : mod->globals()) emitGlobal(os, *g);
   return os.str();
 }

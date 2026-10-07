@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 #include "Opt.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -464,14 +465,12 @@ private:
       if (A.constOff && B.constOff) return A.off == B.off;
       return true; // same object, offset not statically exact
     }
-    // Different root objects.  Two distinct allocas, an alloca vs anything
-    // else, and two distinct globals are all disjoint objects; anything that
-    // touches a param/unknown root may alias a global (params receive arrays
-    // from callers whose addresses are not tracked here).
-    if (A.kind == RootKind::Alloca || B.kind == RootKind::Alloca) return false;
-    bool aObj = A.kind == RootKind::Global;
-    bool bObj = B.kind == RootKind::Global;
-    if (aObj && bObj) return false; // two distinct global objects
+    // Distinct known objects are disjoint. An unknown root (for example a
+    // pointer phi derived from an alloca) can still designate that alloca;
+    // pointer identity alone must not make a private object disjoint.
+    bool aObj = A.kind == RootKind::Global || A.kind == RootKind::Alloca;
+    bool bObj = B.kind == RootKind::Global || B.kind == RootKind::Alloca;
+    if (aObj && bObj) return false;
     return true;
   }
 
@@ -485,9 +484,28 @@ private:
         auto *ld = dynamic_cast<Instruction *>(in->ops[0]);
         if (ld && ld->op == Op::Load && ld->ops.size() == 1 &&
             ld->ops[0] == in->ops[1]) {
-          instrs.erase(instrs.begin() + (long)i);
-          any = true;
-          continue;
+          // A loaded value is only the current memory value until a possible
+          // clobber. In particular, restoring it after a call or aliased store
+          // is observable. A load from another block has no local proof.
+          auto at = std::find_if(instrs.begin(), instrs.begin() + (long)i,
+                                [&](auto &u) { return u.get() == ld; });
+          bool unchanged = at != instrs.begin() + (long)i;
+          while (unchanged && ++at != instrs.begin() + (long)i) {
+            auto *between = at->get();
+            if (between->op == Op::Store && between->ops.size() == 2) {
+              if (maySameLocation(ld->ops[0], between->ops[1]) &&
+                  !(between->ops[0] == ld &&
+                    exactKey(ld->ops[0]) == exactKey(between->ops[1])))
+                unchanged = false;
+            } else if (between->op != Op::Load && !isPure(between->op)) {
+              unchanged = false;
+            }
+          }
+          if (unchanged) {
+            instrs.erase(instrs.begin() + (long)i);
+            any = true;
+            continue;
+          }
         }
       }
       ++i;

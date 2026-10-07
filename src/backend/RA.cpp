@@ -510,12 +510,20 @@ struct Allocator {
             cliqueEdge(reads[p], reads[q]);
 
         int32_t def = sl.def;
+        // A copy establishes equality, so its source being live afterwards
+        // does not by itself interfere with the destination. Later writes
+        // and simultaneous reads still add their usual edges (MIR phis may
+        // redefine either end); do not remove an edge established elsewhere.
+        int32_t copySource = (m.op == MOp::MoveX || m.op == MOp::MoveF) &&
+                                     !std::getenv("SAKU_NO_RA_COPY_EDGE")
+                                 ? m.a : -1;
         if (def >= 0) {
           if (isF[(size_t)def]) {
             int32_t di = fIdx[(size_t)def];
             if (di >= 0)
               for (size_t r = 0; r < nf; ++r)
-                if ((size_t)r != (size_t)di && live[(size_t)fNodes[r]]) {
+                if ((size_t)r != (size_t)di && fNodes[r] != copySource &&
+                    live[(size_t)fNodes[r]]) {
                   adjF[(size_t)di][r] = 1;
                   adjF[r][(size_t)di] = 1;
                 }
@@ -523,7 +531,8 @@ struct Allocator {
             int32_t di = xIdx[(size_t)def];
             if (di >= 0)
               for (size_t r = 0; r < nx; ++r)
-                if ((size_t)r != (size_t)di && live[(size_t)xNodes[r]]) {
+                if ((size_t)r != (size_t)di && xNodes[r] != copySource &&
+                    live[(size_t)xNodes[r]]) {
                   adjX[(size_t)di][r] = 1;
                   adjX[r][(size_t)di] = 1;
                 }
@@ -555,6 +564,7 @@ struct Allocator {
                  std::vector<int32_t> &color,
                  const std::vector<int32_t> &idx,
                  const std::unordered_map<int32_t, std::vector<int32_t>> &partners,
+                 const std::vector<std::vector<int64_t>> &abiHints,
                  const int *calPhys, int Kcal, const int *fullPhys,
                  int Kfull, bool degreeRule) {
     int32_t n = (int32_t)nodes.size();
@@ -661,13 +671,26 @@ struct Allocator {
         if (forbid[(size_t)i][(size_t)pr]) used[(size_t)pr] = 1;
       const int *pal = crossing[(size_t)nodes[(size_t)i]] ? calPhys : fullPhys;
       int32_t ch = -1;
+      // Entry, call and return copies are implicit in MIR, so move partners
+      // cannot see them. Prefer the ABI colour with the greatest estimated
+      // copy saving, but only among legal colours. Call-live values keep the
+      // callee-saved palette; entryForbid still protects unread parameters.
+      int64_t bestHint = 0;
+      for (int32_t ci = 0; ci < K; ++ci) {
+        int32_t pc = pal[ci];
+        int64_t hint = abiHints[(size_t)nodes[(size_t)i]][(size_t)pc];
+        if (!used[(size_t)pc] && hint > bestHint) {
+          bestHint = hint;
+          ch = pc;
+        }
+      }
       // Copy-coalescing hint: try a register already chosen for a value this
       // one is copied to/from.  If they end up in the same register the copy
       // vanishes (self move).  This only reorders the choice among colours
       // that are already legal (unused by an interfering neighbour and not
       // forbidden), so it can never introduce an interference violation.
       auto pit = partners.find(nodes[(size_t)i]);
-      if (pit != partners.end()) {
+      if (ch < 0 && pit != partners.end()) {
         for (int32_t pv : pit->second) {
           if (pv < 0 || pv >= (int32_t)idx.size()) continue;
           int32_t pj = idx[(size_t)pv];
@@ -728,6 +751,47 @@ struct Allocator {
         if (srcs[k] >= 0 && srcs[k] < 32) out[(size_t)di][(size_t)srcs[k]] = 1;
     }
     return out;
+  }
+
+  std::vector<std::vector<int64_t>> abiCopyHints() const {
+    std::vector<std::vector<int64_t>> hints((size_t)maxReg(),
+                                           std::vector<int64_t>(32, 0));
+    if (std::getenv("SAKU_NO_RA_ABI_HINT")) return hints;
+    std::vector<int64_t> copyCost(hints.size(), 0);
+    std::vector<int> depth;
+    computeLoopDepth(depth);
+    for (size_t bi = 0; bi < f.blocks.size(); ++bi) {
+      int64_t weight = int64_t(1) << std::min(depth[bi], 12);
+      auto add = [&](int r, int phys) {
+        if (r >= 0 && phys >= 0 && phys < 32)
+          hints[(size_t)r][(size_t)phys] += weight;
+      };
+      for (const auto &m : f.blocks[bi].instrs) {
+        if ((m.op == MOp::MoveX || m.op == MOp::MoveF) && m.dst >= 0 && m.a >= 0 &&
+            m.dst != m.a) {
+          copyCost[(size_t)m.dst] += weight;
+          copyCost[(size_t)m.a] += weight;
+        }
+        if (m.op == MOp::EntryInt || m.op == MOp::EntryFlt) add(m.dst, m.imm);
+        if (m.op == MOp::Ret && m.ty != Type::Void) add(m.a, 10);
+        if (m.op == MOp::Call) {
+          ArgCursor cursor;
+          for (const auto &arg : m.args) {
+            ArgLoc loc = cursor.next(arg.ty == Type::F32);
+            add(arg.vreg, loc.reg);
+          }
+          add(m.dst, 10);
+        }
+      }
+    }
+    // A cold ABI copy must not defeat the existing affinity of a loop-carried
+    // phi. Its implicit ABI hint can otherwise pin the outer phi to fa0 and
+    // turn one exit copy into copies on every outer-loop iteration. Require
+    // a greater saving than all adjacent MIR copies before taking priority.
+    for (size_t r = 0; r < hints.size(); ++r)
+      if (*std::max_element(hints[r].begin(), hints[r].end()) <= copyCost[r])
+        std::fill(hints[r].begin(), hints[r].end(), 0);
+    return hints;
   }
 
   // insert spill loads/stores for vregs marked in `spilled`.  Spill slot
@@ -888,6 +952,7 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns, std::ostream *st
       std::vector<int32_t> cX((size_t)n, -1), cF((size_t)n, -1);
       auto fX = A.entryForbid(A.xNodes, A.xIdx, false);
       auto fF = A.entryForbid(A.fNodes, A.fIdx, true);
+      auto abiHints = A.abiCopyHints();
       // Move partners (both directions) so colouring can keep a copy's two
       // ends in one register and retire the copy.
       std::unordered_map<int32_t, std::vector<int32_t>> partners;
@@ -899,10 +964,10 @@ void RegisterAllocator::allocate(std::vector<MachineFunc> &fns, std::ostream *st
             partners[m.a].push_back(m.dst);
           }
       bool okX = A.colorFile(A.xNodes, A.adjX, crossing, fX, cX, A.xIdx,
-                             partners, kXCalleePhys, kXCallee, kXFullPhys,
+                             partners, abiHints, kXCalleePhys, kXCallee, kXFullPhys,
                              kXFull, degreeRule);
       bool okF = A.colorFile(A.fNodes, A.adjF, crossing, fF, cF, A.fIdx,
-                             partners, kFCalleePhys, kFCallee, kFFullPhys,
+                             partners, abiHints, kFCalleePhys, kFCallee, kFFullPhys,
                              kFFull, degreeRule);
       if (okX && okF) {
         for (int32_t r = 0; r < n; ++r)

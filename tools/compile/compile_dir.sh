@@ -3,7 +3,7 @@
 # directories with the SakuraCompiler driver, writing one artifact per file.
 #
 # Usage:
-#   ./scripts/compile_dir.sh DIR... -o OUTDIR [MODE] [-- compiler flags]
+#   ./tools/compile/compile_dir.sh DIR... -o OUTDIR [MODE] [-- compiler flags]
 #
 # Modes (exactly one; default --asm):
 #   --asm       RISC-V64 assembly        -> OUTDIR/<dir>/<base>.s
@@ -24,32 +24,34 @@
 #
 # Environment:
 #   COMP        compiler binary          (default: <repo>/build/compiler)
-#   JOBS        parallel jobs  (default: memory-aware, see scripts/memjobs.sh)
+#   JOBS        parallel jobs  (default: memory-aware, see tools/common/memjobs.sh)
 #   KEEP_GOING  set to 1 to continue past a failing file (default: stop)
 #
 # Examples:
-#   ./scripts/compile_dir.sh cases/functional -o /tmp/out          # assembly
-#   ./scripts/compile_dir.sh cases/tensor cases/h_functional \
+#   ./tools/compile/compile_dir.sh cases/functional -o /tmp/out          # assembly
+#   ./tools/compile/compile_dir.sh cases/tensor cases/h_functional \
 #       -o /tmp/out --cf -O1                                        # cf IR
-#   ./scripts/compile_dir.sh cases/functional -o /tmp/out --asm -O0 -- --dump-cf
+#   ./tools/compile/compile_dir.sh cases/functional -o /tmp/out --asm -O0 -- --dump-cf
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-COMP="${COMP:-$ROOT/build/compiler}"
+BUILD_TREE="${BUILD_DIR:-build}"
+case "$BUILD_TREE" in /*) ;; *) BUILD_TREE="$ROOT/$BUILD_TREE" ;; esac
+COMP="${COMP:-$BUILD_TREE/compiler}"
 if [ -n "${JOBS:-}" ]; then
   JOBS="$JOBS"
 else
   # shellcheck source=/dev/null
-  . "$ROOT/scripts/memjobs.sh"
+  . "$ROOT/tools/common/memjobs.sh"
   JOBS="$(memjobs)"
 fi
 KEEP_GOING="${KEEP_GOING:-0}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-180}"
 
 if [ ! -x "$COMP" ]; then
-  echo "ERROR: compiler not found at $COMP - run ./scripts/build.sh first" >&2
+  echo "ERROR: compiler not found at $COMP - run ./tools/build/build.sh first" >&2
   exit 2
 fi
 

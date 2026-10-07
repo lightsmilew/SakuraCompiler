@@ -2,7 +2,7 @@
 """Build comparable rv64gc binaries and benchmark on an already running VM.
 
 Example (WSL/Linux):
-  QEMU_PASS=... python3 tools/benchmark.py --variant before=build/compiler.before \
+  QEMU_PASS=... python3 tools/benchmark/benchmark.py --variant before=build/compiler.before \
     --variant after=build/compiler --llvm clang-18 --library build/libsysy_riscv.a
 
 Use --compile-only for assembly/RA diagnostics without a guest. Compiler work
@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import tarfile
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def sha256(path):
@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--variant", action="append", default=[], metavar="NAME=COMPILER")
     parser.add_argument("--llvm", help="Clang executable, e.g. clang-18")
     parser.add_argument("--suite", type=pathlib.Path, default=ROOT / "cases/performance2026")
-    parser.add_argument("--out", type=pathlib.Path, default=ROOT / "build/performance")
+    parser.add_argument("--out", type=pathlib.Path, default=ROOT / "build/benchmarks/performance2026")
     parser.add_argument("--library", type=pathlib.Path)
     parser.add_argument("--cc", default="riscv64-linux-gnu-gcc")
     parser.add_argument("--guest", default="ubuntu@127.0.0.1")
@@ -61,6 +61,8 @@ def main():
     if not args.compile_only and (not args.library or not args.library.is_file()):
         parser.error("--library must point to libsysy_riscv.a for executable tests")
     out = args.out.resolve()
+    if out == ROOT / 'docs' or ROOT / 'docs' in out.parents:
+        parser.error('comparison results belong in results/ or build/, not docs/')
     out.mkdir(parents=True, exist_ok=True)
     (out / "cases").mkdir(exist_ok=True)
     manifest = {"target": "rv64gc/lp64d", "runs": args.runs,
@@ -110,14 +112,14 @@ def main():
             asm = dest / (src.stem + ".s")
             if name == "llvm":
                 cpp = dest / (src.stem + ".cpp")
-                cpp.write_text((ROOT / "scripts/sysy_prelude.h").read_text() + src.read_text())
+                cpp.write_text((ROOT / "tools/compile/sysy_prelude.h").read_text() + src.read_text())
                 command = [str(binary), *flags, "-S", str(cpp), "-o", str(asm)]
             else:
                 command = [str(binary), str(src.resolve()), "-O2", "--pass-stats", "-o", str(asm)]
             signature = dict(compiler=manifest["variants"][name]["sha256"],
                              source=sha256(src), flags=flags, environment=pass_env)
             if name == "llvm":
-                signature["prelude"] = sha256(ROOT / "scripts/sysy_prelude.h")
+                signature["prelude"] = sha256(ROOT / "tools/compile/sysy_prelude.h")
             key = json.dumps(signature, sort_keys=True)
             keyfile = dest / (src.stem + ".compile.key")
             cached = (not args.force and asm.is_file() and keyfile.is_file()
@@ -138,7 +140,7 @@ def main():
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
     if args.compile_only:
         return 0
-    shutil.copy2(ROOT / "tools/benchmark_guest.py", out / "benchmark_guest.py")
+    shutil.copy2(ROOT / "tools/benchmark/benchmark_guest.py", out / "benchmark_guest.py")
     archive = out / "payload.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         for file in [out / "benchmark_guest.py", out / "manifest.json"]:

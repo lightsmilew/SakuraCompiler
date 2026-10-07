@@ -190,7 +190,8 @@ flowchart TD
     SUB["纯 cf 模块<br/>(verify-cf-only 之后)"] --> ISEL[ISel<br/>每个 IR op -> 1..n 条 RISC-V MInst<br/>虚拟寄存器 + PtrVal 懒解析栈槽]
     ISEL --> LIV[Liveness<br/>逐机器函数计算活跃区间]
     LIV --> IG[干涉图 + Briggs 图着色 RA<br/>spill/remat 迭代至可着色]
-    IG --> FRAME[帧布局<br/>16B 对齐 · 按着色推导保存集合]
+    IG --> LAYOUT[物理寄存器 MIR<br/>复制清理 · 循环旋转 · 最终块链布局和分支折叠]
+    LAYOUT --> FRAME[帧布局<br/>16B 对齐 · 按着色推导保存集合]
     FRAME --> WRITE[Asm 文本<br/>GNU as 语法 .s]
 ```
 
@@ -205,15 +206,22 @@ flowchart TD
 寄存器分配是经典 Briggs 图着色:预着色物理寄存器(`a0-a7`/`fa0-fa7`、`t`/`ft` 临时、
 被调用者保存 `s`/`fs`),simplify/spill 多轮迭代直到可着色,溢出的虚拟寄存器落栈;
 caller/callee-saved 集合按最终着色推导,序言/尾声只保存实际用到的寄存器。
+干涉图对复制建立的相等值保留共享寄存器机会；ABI 参数和返回值使用
+受冲突约束及循环成本保护的着色偏好，详见 [复制生成](move-generation.md)。
 
 汇编输出面向 RISC-V64gc 的 GNU `as` 子集:16 字节栈对齐、调用前预留出参空间
 (`ArgCursor` 先分配 `a0-a7`/`fa0-fa7`,溢出到 8 字节栈槽),帧/全局偏移直接折进
 `lw`/`sw`(及 FP)形式。
+调用的并行寄存器参数按依赖顺序串行化，只有真实交换环使用预留
+`t1`/`ft1`，无需额外参数 shuffle 栈区。输出以英文生成署名开头，本地
+标签按模块统一编号为 `.L数字`，MIR 中保留描述性名字。最终块布局
+冻结隐式后继、连接有收益的块链并恢复直落路径，详见
+[基本块布局](polyhedral-layout.md)。
 
 ## 测试
 
 `cases/{functional,h_functional,performance2026,tensor}` 由宿主机上的
 `build/compiler` 编译,汇编被推到 QEMU RISC-V Ubuntu 虚机内与 `libsysy_riscv.a`
 汇编/链接后运行,stdout + 退出码与参考 `.out` 逐字节比对。
-`scripts/test.sh` 与 `scripts/run.sh -qemu-test` 驱动整个流程;汇编与上次已验证结果
+`tools/test/test.sh` 与 `tools/compile/run.sh -qemu-test` 驱动整个流程;汇编与上次已验证结果
 一致时经 `build/.verify_cache` 跳过虚机重跑。

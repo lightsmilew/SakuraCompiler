@@ -2,19 +2,19 @@
 # build.sh -- build the SakuraCompiler driver binary.
 #
 # Usage:
-#   ./scripts/build.sh            incremental build (default)
-#   ./scripts/build.sh clean      wipe build/ and rebuild from scratch
+#   ./tools/build/build.sh            incremental build (default)
+#   ./tools/build/build.sh clean      wipe build/ and rebuild from scratch
 #
 # Environment:
 #   BUILD_DIR   build tree location            (default: <repo>/build)
-#   JOBS        parallel jobs  (default: memory-aware, see scripts/memjobs.sh)
+#   JOBS        parallel jobs  (default: memory-aware, see tools/common/memjobs.sh)
 #
 # The only required toolchain is CMake >= 3.10 and a C++17 compiler; the
 # ANTLR4 runtime is vendored under 3rd_party/, so nothing is fetched from the
 # network.  The resulting driver is <BUILD_DIR>/compiler.
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 BUILD_DIR="${BUILD_DIR:-build}"
@@ -22,7 +22,7 @@ if [ -n "${JOBS:-}" ]; then
   JOBS="$JOBS"
 else
   # shellcheck source=/dev/null
-  . "$ROOT/scripts/memjobs.sh"
+  . "$ROOT/tools/common/memjobs.sh"
   JOBS="$(memjobs)"
 fi
 

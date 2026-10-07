@@ -109,6 +109,11 @@ public:
   // the block order and the layout-dependent terminators change; the CFG and
   // every register/operand is untouched.  Returns the number of loops rotated.
   size_t rotateLoopsByLayout(std::vector<MachineFunc> &fns);
+
+  // Forward branch-only blocks, join linear chains, build profitable weighted
+  // layout chains, then fold/invert branches against the physical successor.
+  // Returns the net branches removed.
+  size_t finalizeBlockLayout(std::vector<MachineFunc> &fns);
 };
 
 } // namespace backend

@@ -41,7 +41,15 @@ static int32_t execute(const MachineFunc &f, int32_t argument = 0) {
       case MOp::EntryInt: r[m.dst] = argument; break;
       case MOp::Li: r[m.dst] = m.imm; break;
       case MOp::MoveX: r[m.dst] = a; break;
-      case MOp::IAddI: r[m.dst] = int32_t(uint32_t(a) + uint32_t(m.imm)); break;
+      case MOp::IAddI: r[m.dst] = m.ty == Type::Ptr ? a + m.imm
+                                                  : int64_t(int32_t(uint32_t(a) + uint32_t(m.imm))); break;
+      case MOp::IAdd: r[m.dst] = m.ty == Type::Ptr ? a + b
+                                                 : int64_t(int32_t(uint32_t(a) + uint32_t(b))); break;
+      case MOp::LeaFrame: r[m.dst] = 0x123456780000LL + m.imm; break;
+      case MOp::LeaGlobal: r[m.dst] = 0x123456780000LL; break;
+      case MOp::Call:
+        require(m.sym == "pointer_probe" && m.args.size() == 1, "unsupported call fixture");
+        r[m.dst] = int32_t(get(m.args[0].vreg)); break;
       case MOp::SrlI: r[m.dst] = int32_t(uint32_t(a) >> m.imm); break;
       case MOp::IDiv: r[m.dst] = int32_t(a) / int32_t(b); break;
       case MOp::ISlti: r[m.dst] = a < m.imm; break;
@@ -257,10 +265,44 @@ static void promotedPhiLifetime() {
           "folding a promoted phi lost its replacement value");
 }
 
+static void pointerComparisons() {
+  for (bool global : {false, true}) {
+    Module mod("pointer-comparison");
+    auto *f = mod.addFunction("test", Type::I32, {{Type::I32, false, "condition"}}, false);
+    auto *e = block(f, "entry"), *yes = block(f, "yes"), *no = block(f, "no");
+    Value *base;
+    if (global) base = mod.addGlobal("data", Type::I32, 8, false, false, {});
+    else { auto *a = emit(e, Op::Alloca, Type::Ptr, {}); a->n = 8; base = a; }
+    auto *p = emit(e, Op::Gep, Type::Ptr, {base, mod.constInt(12)});
+    emit(e, Op::CondBr, Type::Void, {f->args[0].get(), yes, no});
+    for (auto *arm : {yes, no}) {
+      auto *q = emit(arm, Op::Gep, Type::Ptr, {base, mod.constInt(12)});
+      auto *cmp = emit(arm, Op::ICmp, Type::I32, {p, q}); cmp->cond = Cond::Eq;
+      emit(arm, Op::Ret, Type::Void, {cmp});
+    }
+    auto mf = InstructionSelector().select(&mod)[0];
+    require(execute(mf, 0) == 1 && execute(mf, 1) == 1,
+            "lazy pointer comparison unbound or cached across sibling blocks");
+  }
+  Module mod("pointer-call-siblings");
+  auto *probe=mod.addFunction("pointer_probe",Type::I32,{{Type::Ptr,true,"p"}},true);
+  auto *f=mod.addFunction("test",Type::I32,{{Type::Ptr,true,"base"}},false);
+  auto *e=block(f,"entry"), *yes=block(f,"yes"), *no=block(f,"no");
+  auto *p=emit(e,Op::Gep,Type::Ptr,{f->args[0].get(),mod.constInt(12)});
+  emit(e,Op::CondBr,Type::Void,{f->args[0].get(),yes,no});
+  for(auto *arm:{yes,no}) {
+    auto *result=emit(arm,Op::Call,Type::I32,{probe,p});
+    emit(arm,Op::Ret,Type::Void,{result});
+  }
+  auto mf=InstructionSelector().select(&mod)[0];
+  require(execute(mf,0)==12 && execute(mf,4096)==4108,
+          "pointer call cached an address temporary across sibling blocks");
+}
+
 int main() {
   try {
     branches(); phiClobber(); swappedGuard(); conditionalPhiEdges();
-    constantInlining(); promotedPhiLifetime();
+    constantInlining(); promotedPhiLifetime(); pointerComparisons();
     std::cout << "selector regression tests passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n'; return 1;

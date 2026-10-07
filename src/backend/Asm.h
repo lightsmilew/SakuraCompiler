@@ -8,6 +8,7 @@
 #pragma once
 
 #include <string>
+#include <iosfwd>
 #include <vector>
 
 #include "../midend/ir/IR.h"
@@ -23,7 +24,8 @@ public:
   // Emit the .text section for every function in `fns` followed by .data/.bss
   // section for the module's globals.  `mod` is read for globals only; the
   // functions were already consumed by InstructionSelector.
-  std::string write(ir::Module *mod, std::vector<MachineFunc> &fns);
+  std::string write(ir::Module *mod, std::vector<MachineFunc> &fns,
+                    std::ostream *stats = nullptr);
 };
 
 } // namespace backend

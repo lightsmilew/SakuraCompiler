@@ -41,4 +41,8 @@ if(SAKURA_BUILD_TESTS)
     src/midend/pass/OptLoopSplit.cpp src/midend/pass/OptLoop.cpp
     src/midend/pass/OptEffects.cpp)
   add_test(NAME loop_split_regression COMMAND loop_split_regression)
+  add_executable(memory_regression tests/memory_regression.cpp
+    src/midend/ir/IR.cpp src/midend/pass/OptUtil.cpp src/midend/pass/OptMem.cpp
+    src/midend/pass/OptEffects.cpp)
+  add_test(NAME memory_regression COMMAND memory_regression)
 endif()
